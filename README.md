@@ -104,6 +104,10 @@ All configuration is via environment variables. The most common:
 | `CS2DASH_COOKIE_SECURE` | `1` | Mark the session cookie HTTPS-only. Set `0` for plain-HTTP local testing. |
 | `CS2DASH_DATA_DIR` | `./data` | Location of SQLite DB, portfolios, and settings. |
 | `STEAM_COOKIE` | — | Steam session for reliable chart history. Never commit or log it. |
+| `CSGOTRADER_PRICE_BASE` | `https://prices.csgotrader.app/latest` | Base URL for provider snapshot pricing. |
+| `MARKET_SOURCE_PRIORITY` | `steam,csfloat,buff163,youpin,skinport` | Provider order for current price selection. |
+| `AUTO_MARKET_REFRESH` | `1` | Enable periodic background provider snapshot refresh. `start.sh` defaults new local envs to `0` while importing/debugging. |
+| `DATA_TASK_RESUME_ENABLED` | `1` | Resume interrupted background data fills on startup. `start.sh` defaults new local envs to `0` to avoid stale jobs locking local imports. |
 
 ## Project Structure
 

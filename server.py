@@ -80,6 +80,7 @@ DATA_TASK_EVENTS = deque(maxlen=240)
 DATA_TASK_PERSIST_BACKLOG = deque(maxlen=600)
 DATA_TASK_PERSIST_NOTICE_AT = 0.0
 ACTIVE_DATA_TASK_ID = None
+DATA_TASK_RESUME_ENABLED = os.environ.get('DATA_TASK_RESUME_ENABLED', '1').strip().lower() not in ('0', 'false', 'no')
 DATA_TASK_RESUME_MAX_AGE_SECONDS = int(os.environ.get('DATA_TASK_RESUME_MAX_AGE_SECONDS', str(24 * 60 * 60)))
 STEAM_LAST_REQUEST_AT = 0.0
 STEAM_MIN_INTERVAL = float(os.environ.get('STEAM_MIN_INTERVAL', '1.25'))
@@ -183,11 +184,12 @@ def resolve_auth_hash():
 def create_session(username):
     token = secrets.token_urlsafe(32)
     now = int(time.time())
-    with db() as conn:
-        conn.execute(
-            'INSERT INTO auth_sessions(token,username,created_at,expires_at) VALUES(?,?,?,?)',
-            (token, username, now, now + SESSION_TTL_SECONDS),
-        )
+    with SQLITE_WRITE_LOCK:
+        with db() as conn:
+            conn.execute(
+                'INSERT INTO auth_sessions(token,username,created_at,expires_at) VALUES(?,?,?,?)',
+                (token, username, now, now + SESSION_TTL_SECONDS),
+            )
     return token
 
 
@@ -195,30 +197,36 @@ def get_session_user(token):
     if not token:
         return None
     now = int(time.time())
+    username = None
+    expired = False
     with db() as conn:
         row = conn.execute(
             'SELECT username,expires_at FROM auth_sessions WHERE token=?', (token,)
         ).fetchone()
         if not row:
             return None
-        if row['expires_at'] < now:
-            conn.execute('DELETE FROM auth_sessions WHERE token=?', (token,))
-            return None
-    return row['username']
+        username = row['username']
+        expired = row['expires_at'] < now
+    if expired:
+        delete_session(token)
+        return None
+    return username
 
 
 def delete_session(token):
     if not token:
         return
-    with db() as conn:
-        conn.execute('DELETE FROM auth_sessions WHERE token=?', (token,))
+    with SQLITE_WRITE_LOCK:
+        with db() as conn:
+            conn.execute('DELETE FROM auth_sessions WHERE token=?', (token,))
 
 
 def purge_expired_sessions():
     now = int(time.time())
     try:
-        with db() as conn:
-            conn.execute('DELETE FROM auth_sessions WHERE expires_at < ?', (now,))
+        with SQLITE_WRITE_LOCK:
+            with db() as conn:
+                conn.execute('DELETE FROM auth_sessions WHERE expires_at < ?', (now,))
     except sqlite3.Error:
         pass
 
@@ -546,6 +554,11 @@ def restore_data_tasks_from_db(conn):
 
 
 def resume_persisted_data_task():
+    global ACTIVE_DATA_TASK_ID
+    if not DATA_TASK_RESUME_ENABLED:
+        with DATA_TASK_LOCK:
+            ACTIVE_DATA_TASK_ID = None
+        return False
     active = None
     with DATA_TASK_LOCK:
         if ACTIVE_DATA_TASK_ID:
@@ -1051,13 +1064,14 @@ def get_snapshots():
 
 
 def replace_snapshots(snaps):
-    with db() as conn:
-        conn.execute("DELETE FROM snapshots")
-        conn.execute("DELETE FROM snapshot_items")
-        for idx, snap in enumerate(snaps if isinstance(snaps, list) else [snaps]):
-            put_snapshot(conn, snap, idx)
-            index_snapshot_items(conn, snap, idx)
-    write_json(SNAPS_FILE, snaps)
+    with SQLITE_WRITE_LOCK:
+        with db() as conn:
+            conn.execute("DELETE FROM snapshots")
+            conn.execute("DELETE FROM snapshot_items")
+            for idx, snap in enumerate(snaps if isinstance(snaps, list) else [snaps]):
+                put_snapshot(conn, snap, idx)
+                index_snapshot_items(conn, snap, idx)
+        write_json(SNAPS_FILE, snaps)
 
 
 def portfolio_label_from_snapshot(label):
@@ -1260,12 +1274,13 @@ def get_portfolios():
 
 def replace_portfolios(portfolios):
     portfolios = portfolios if isinstance(portfolios, list) else [portfolios]
-    with db() as conn:
-        conn.execute("DELETE FROM portfolios")
-        conn.execute("DELETE FROM portfolio_items")
-        for idx, portfolio in enumerate(portfolios):
-            put_portfolio(conn, portfolio, idx)
-    write_json(PORTFOLIOS_FILE, portfolios)
+    with SQLITE_WRITE_LOCK:
+        with db() as conn:
+            conn.execute("DELETE FROM portfolios")
+            conn.execute("DELETE FROM portfolio_items")
+            for idx, portfolio in enumerate(portfolios):
+                put_portfolio(conn, portfolio, idx)
+        write_json(PORTFOLIOS_FILE, portfolios)
 
 
 def backfill_price_observations(conn):

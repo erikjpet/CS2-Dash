@@ -23,7 +23,9 @@ Options:
   -h, --help        Show this help.
 
 The script creates an ignored local env file, asks for the required login
-password when it is missing, then starts server.py.
+password when it is missing, records local pricing settings, then starts
+server.py. Provider prices use CSGO Trader snapshots; Steam chart history is
+more reliable when STEAM_COOKIE is configured.
 EOF
 }
 
@@ -205,23 +207,39 @@ create_env_file() {
   echo "The file is ignored by Git."
   echo
 
-  local user bind data_dir cookie_secure auto_refresh steam_cookie auth_hash
+  local user bind data_dir cookie_secure auto_refresh resume_tasks steam_cookie auth_hash price_base source_priority bulk_source
   user="$(prompt_default "Login username" "${CS2DASH_AUTH_USER:-admin}")"
   bind="$(prompt_default "Bind address" "${CS2DASH_BIND:-127.0.0.1}")"
   data_dir="$(prompt_default "Data directory" "${CS2DASH_DATA_DIR:-data}")"
   cookie_secure="$(prompt_default "Use HTTPS-only cookies? Use 0 for local http:// testing" "${CS2DASH_COOKIE_SECURE:-0}")"
-  auto_refresh="$(prompt_default "Enable background market refresh? 1=yes, 0=no" "${AUTO_MARKET_REFRESH:-1}")"
 
   write_env_value "CS2DASH_AUTH_USER" "$user"
   write_env_value "CS2DASH_BIND" "$bind"
   write_env_value "CS2DASH_DATA_DIR" "$data_dir"
   write_env_value "CS2DASH_COOKIE_SECURE" "$cookie_secure"
-  write_env_value "AUTO_MARKET_REFRESH" "$auto_refresh"
 
   auth_hash="$(prompt_password_hash)"
   write_env_value "CS2DASH_AUTH_PASSWORD_HASH" "$auth_hash"
 
-  steam_cookie="$(prompt_default "Steam cookie (optional, blank to skip)" "")"
+  echo
+  echo "Pricing setup"
+  echo "Provider prices come from CSGO Trader snapshots. Steam chart history is separate"
+  echo "and works best with a Steam login cookie."
+  echo
+
+  price_base="$(prompt_default "CSGO Trader price snapshot base URL" "${CSGOTRADER_PRICE_BASE:-https://prices.csgotrader.app/latest}")"
+  source_priority="$(prompt_default "Provider source priority" "${MARKET_SOURCE_PRIORITY:-steam,csfloat,buff163,youpin,skinport}")"
+  bulk_source="$(prompt_default "Bulk price source mode" "${MARKET_BULK_SOURCE:-any}")"
+  auto_refresh="$(prompt_default "Enable automatic background market refresh? Use 0 while importing locally" "${AUTO_MARKET_REFRESH:-0}")"
+  resume_tasks="$(prompt_default "Resume interrupted background data fills on startup? Use 0 while debugging locally" "${DATA_TASK_RESUME_ENABLED:-0}")"
+
+  write_env_value "CSGOTRADER_PRICE_BASE" "$price_base"
+  write_env_value "MARKET_SOURCE_PRIORITY" "$source_priority"
+  write_env_value "MARKET_BULK_SOURCE" "$bulk_source"
+  write_env_value "AUTO_MARKET_REFRESH" "$auto_refresh"
+  write_env_value "DATA_TASK_RESUME_ENABLED" "$resume_tasks"
+
+  steam_cookie="$(prompt_default "Steam cookie for chart history (optional, blank to skip)" "")"
   if [ -n "$steam_cookie" ]; then
     write_env_value "STEAM_COOKIE" "$steam_cookie"
     write_env_value "STEAM_MIN_INTERVAL" "${STEAM_MIN_INTERVAL:-2.0}"
@@ -256,7 +274,11 @@ ensure_default "CS2DASH_AUTH_USER" "admin"
 ensure_default "CS2DASH_BIND" "127.0.0.1"
 ensure_default "CS2DASH_DATA_DIR" "data"
 ensure_default "CS2DASH_COOKIE_SECURE" "0"
-ensure_default "AUTO_MARKET_REFRESH" "1"
+ensure_default "CSGOTRADER_PRICE_BASE" "https://prices.csgotrader.app/latest"
+ensure_default "MARKET_SOURCE_PRIORITY" "steam,csfloat,buff163,youpin,skinport"
+ensure_default "MARKET_BULK_SOURCE" "any"
+ensure_default "AUTO_MARKET_REFRESH" "0"
+ensure_default "DATA_TASK_RESUME_ENABLED" "0"
 
 if ! auth_disabled && auth_hash_missing; then
   if ! is_interactive; then
@@ -283,8 +305,22 @@ echo "  URL:     http://${CS2DASH_BIND:-127.0.0.1}:$PORT"
 echo "  Data:    ${CS2DASH_DATA_DIR:-data}"
 echo "  Auth:    $AUTH_SUMMARY"
 echo "  Cookies: CS2DASH_COOKIE_SECURE=${CS2DASH_COOKIE_SECURE:-0}"
+echo "  Pricing: CSGOTRADER_PRICE_BASE=${CSGOTRADER_PRICE_BASE:-https://prices.csgotrader.app/latest}"
+echo "  Sources: MARKET_SOURCE_PRIORITY=${MARKET_SOURCE_PRIORITY:-steam,csfloat,buff163,youpin,skinport}"
+echo "  Refresh: AUTO_MARKET_REFRESH=${AUTO_MARKET_REFRESH:-0}"
+echo "  Resume:  DATA_TASK_RESUME_ENABLED=${DATA_TASK_RESUME_ENABLED:-0}"
+if [ -n "${STEAM_COOKIE:-}" ]; then
+  echo "  Steam:   STEAM_COOKIE configured for chart history"
+else
+  echo "  Steam:   no STEAM_COOKIE; provider prices still work, Steam chart history may be limited"
+fi
 if [ "${CS2DASH_COOKIE_SECURE:-0}" != "0" ]; then
   echo "  Note:    secure cookies require HTTPS; set CS2DASH_COOKIE_SECURE=0 for local http:// testing."
+fi
+if [ "${AUTO_MARKET_REFRESH:-0}" = "0" ]; then
+  echo "  Next:    after login/import, use Pull Market Data to populate or refresh cached prices."
+else
+  echo "  Next:    background market refresh is on; avoid importing while a market pull is running."
 fi
 echo
 
