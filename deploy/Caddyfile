@@ -1,0 +1,25 @@
+# Caddy reverse proxy for cs2dash — install to /etc/caddy/Caddyfile
+#
+# Caddy automatically provisions and renews a Let's Encrypt certificate for the
+# hostname below (needs ports 80 and 443 reachable from the internet). The app
+# handles its own login, so Caddy only terminates TLS and proxies to loopback.
+#
+#   sudo systemctl reload caddy
+#   journalctl -u caddy -f
+#
+# Replace the hostname with your DuckDNS (or other) domain.
+
+cs2dash.example.duckdns.org {
+    encode zstd gzip
+
+    # Security headers.
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        -Server
+    }
+
+    reverse_proxy 127.0.0.1:8080
+}

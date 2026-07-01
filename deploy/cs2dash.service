@@ -1,0 +1,37 @@
+# systemd unit for cs2dash — install to /etc/systemd/system/cs2dash.service
+#
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now cs2dash
+#   sudo systemctl status cs2dash
+#   journalctl -u cs2dash -f      # live logs
+#
+# Adjust User/Group, WorkingDirectory, and the port to match your box.
+
+[Unit]
+Description=cs2dash CS2 portfolio dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cs2dash
+Group=cs2dash
+WorkingDirectory=/opt/cs2-dash
+EnvironmentFile=/etc/cs2dash/cs2dash.env
+ExecStart=/usr/bin/python3 /opt/cs2-dash/server.py 8080
+Restart=on-failure
+RestartSec=5
+
+# --- Hardening ---
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+# The app must be able to write its data dir (SQLite + WAL, portfolios.json).
+ReadWritePaths=/var/lib/cs2dash
+
+[Install]
+WantedBy=multi-user.target

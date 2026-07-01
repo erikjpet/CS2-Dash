@@ -1,0 +1,31 @@
+# Runtime state
+data/
+cache/
+__pycache__/
+*.py[cod]
+
+# Secrets — never commit real credentials
+*.env
+!*.env.example
+cs2dash.env
+
+# Test artifacts and sample/personal data (not part of the release)
+test-artifacts/
+test-portfolio-import.txt
+
+# Local logs and generated reports
+*.log
+report.html
+
+# Reference/import scratch folders
+old/
+
+# Standalone pricing experiment, not part of the app release
+pricing-lab/
+docs/pricing-data-audit-and-rework-plan.md
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
