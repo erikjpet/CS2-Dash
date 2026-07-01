@@ -16,15 +16,28 @@ Version 1.0 local-first dashboard for Counter-Strike 2 portfolio valuation, full
 
 ## Quick Start
 
-cs2dash requires a login. Generate a password hash, then start the server:
+cs2dash requires a login. The convenience script handles first-run setup:
 
 ```bash
-python server.py --hash-password          # prompts, prints a CS2DASH_AUTH_PASSWORD_HASH=... line
-export CS2DASH_AUTH_PASSWORD_HASH='pbkdf2_sha256$...'   # paste the value it printed
-python server.py 8080
+./start.sh
 ```
 
-Open `http://localhost:8080` and sign in. The default username is `admin` (override with `CS2DASH_AUTH_USER`). The server binds `127.0.0.1` by default.
+On first run it creates an ignored `cs2dash.env`, asks for the required login password, sets `CS2DASH_COOKIE_SECURE=0` for local `http://` testing, creates the data directory, and starts `server.py`. Open `http://localhost:8080` and sign in. The default username is `admin`; the server binds `127.0.0.1` by default.
+
+To rebuild the local env file later:
+
+```bash
+./start.sh --setup
+```
+
+Manual startup still works if you prefer to provide environment variables yourself:
+
+```bash
+python server.py --hash-password
+export CS2DASH_AUTH_PASSWORD_HASH='pbkdf2_sha256$...'
+export CS2DASH_COOKIE_SECURE=0
+python server.py 8080
+```
 
 For a **trusted LAN only**, you can skip login and listen on all interfaces:
 
@@ -35,7 +48,7 @@ python server.py 8080
 # then open http://<server-lan-ip>:8080
 ```
 
-You can also use the convenience script (honors the same environment variables):
+The convenience script honors the same environment variables and accepts an optional port:
 
 ```bash
 ./start.sh
