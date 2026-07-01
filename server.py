@@ -1086,13 +1086,54 @@ def portfolio_items_from_data(data):
             'category': item[ITEM_IDX['cat']],
             'group_name': item[ITEM_IDX['grp']],
         })
-    return rows
+    return normalize_portfolio_item_rows(rows)
+
+
+def normalize_portfolio_item_rows(rows):
+    """Collapse duplicate market-item rows caused by doubled import payloads."""
+    normalized = []
+    seen_exact = set()
+    by_name = {}
+    for row in rows or []:
+        name = ' '.join(str(row.get('name') or '').split())
+        if not name:
+            continue
+        try:
+            qty = float(row.get('qty') or 0)
+        except (TypeError, ValueError):
+            continue
+        if qty <= 0:
+            continue
+
+        category = row.get('category')
+        group_name = row.get('group_name')
+        exact_key = (name.casefold(), qty, str(category or '').casefold(), str(group_name or '').casefold())
+        if exact_key in seen_exact:
+            continue
+        seen_exact.add(exact_key)
+
+        name_key = name.casefold()
+        if name_key in by_name:
+            by_name[name_key]['qty'] += qty
+            continue
+
+        clean = dict(row)
+        clean['name'] = name
+        clean['base_name'] = clean.get('base_name') or base_item_name(name)
+        clean['qty'] = qty
+        clean['sort_key'] = len(normalized)
+        normalized.append(clean)
+        by_name[name_key] = clean
+
+    for idx, row in enumerate(normalized):
+        row['sort_key'] = idx
+    return normalized
 
 
 def portfolio_data_from_rows(rows):
     r2 = lambda n: round(float(n or 0), 2)
     items = []
-    for r in rows:
+    for r in normalize_portfolio_item_rows(rows):
         qty = float(r.get('qty') or 0)
         items.append([
             r.get('name'), qty, None, None, None, None,
@@ -1146,7 +1187,12 @@ def portfolio_data_from_rows(rows):
 def put_portfolio(conn, portfolio, sort_key):
     if not portfolio.get('id'):
         portfolio['id'] = 'portfolio_' + str(int(time.time() * 1000)) + '_' + str(sort_key)
-    data = portfolio.get('data') or {}
+    source_data = portfolio.get('data') or {}
+    rows = portfolio_items_from_data(source_data)
+    data = portfolio_data_from_rows(rows)
+    if isinstance(source_data, dict) and source_data.get('importStats'):
+        data['importStats'] = source_data.get('importStats')
+    portfolio['data'] = data
     conn.execute(
         """INSERT OR REPLACE INTO portfolios
            (id, sort_key, label, imported_at, data)
@@ -1160,7 +1206,6 @@ def put_portfolio(conn, portfolio, sort_key):
         ),
     )
     conn.execute("DELETE FROM portfolio_items WHERE portfolio_id=?", (portfolio.get('id'),))
-    rows = portfolio_items_from_data(data)
     conn.executemany(
         """INSERT INTO portfolio_items
            (portfolio_id, sort_key, name, base_name, qty, import_unit_price,
