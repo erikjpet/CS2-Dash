@@ -88,7 +88,7 @@ test('both item bases send true sort, bounds and page offset before server limit
  for(const basis of ['research','cash'])for(const sort of ['latestPrice','source','latestAt']){
   const values={'item-search':'SYNTHETIC','item-coll-filter':'','item-type-filter':'','item-grade-filter':'','item-min-price':'1000','item-max-price':'10000'};
   const globals={URLSearchParams,_itemsBasis:basis,_marketItemsOffset:500,_globalScale:90,_searchTerms:[],_blTerms:[],_sortKey:sort,_sortDir:-1,document:{getElementById:id=>({value:values[id]})}};
-  const url=new URL(run(['marketItemsQueryState','marketItemsUrl'],'marketItemsUrl()',globals),'https://fixture.invalid');
+  const url=new URL(run(['researchPeriodDays','marketItemsQueryState','marketItemsUrl'],'marketItemsUrl()',globals),'https://fixture.invalid');
   assert.equal(url.pathname,basis==='cash'?'/api/current-market-items':'/api/market-items');
   assert.equal(url.searchParams.get('sort'),sort);assert.equal(url.searchParams.get('min_price'),'1000');assert.equal(url.searchParams.get('max_price'),'10000');assert.equal(url.searchParams.get('offset'),'500');assert.equal(url.searchParams.get('limit'),'500');
  }
@@ -173,6 +173,137 @@ test('restored tables scroll locally rather than clipping fields on mobile',()=>
  assert.match(source,/\.card:has\(\.pulse-table\),#bk-table-wrap,#market-bk-table-wrap\{overflow-x:auto/);
  assert.match(source,/\.header-center\{flex-wrap:wrap;min-width:0\}/);
  assert.match(source,/\.snap-info h3[^}]*overflow-wrap:anywhere/);
+});
+
+function presetReplayHarness(){
+ const elements=new Map(),rendered=[];
+ const metadata={Alpha:{collection:'Collection A',rarity:'Covert',type:'Rifle',weapon:'Alpha weapon'},Beta:{collection:'Collection B',rarity:'Classified',type:'Pistol'},Unknown:{collection:'Collection A',rarity:'Covert',type:'Rifle'}};
+ function element(id){
+  let html='',value='',options=[{value:''}];
+  const select=['item-coll-filter','item-type-filter','item-grade-filter','global-scale'].includes(id);
+  const el={id,style:{},textContent:'',disabled:false,checked:false,classList:{contains:()=>id==='tab-items'}};
+  Object.defineProperties(el,{
+   innerHTML:{get:()=>html,set:v=>{html=String(v);if(select){options=[...html.matchAll(/<option\b[^>]*value="([^"]*)"/g)].map(m=>({value:m[1]}));if(!options.some(o=>o.value===value))value='';}}},
+   options:{get:()=>options},
+   value:{get:()=>value,set:v=>{const next=String(v);value=!select||options.some(o=>o.value===next)?next:'';}},
+  });
+  return el;
+ }
+ const globals={IDX,Map,Set,Array,Number,String,JSON,Math,URLSearchParams,AbortController,
+  active:{id:'SYNTHETIC',label:'Invented portfolio',data:{items:[['Alpha',1,null,null,null,null,'Category A','Rifle'],['Beta',1,null,null,null,null,'Category B','Pistol']],totals:{count:2}}},
+  _itemsBasis:'cash',_itemsMode:'portfolio',_marketItemsOffset:500,_marketItemsKey:'old',_marketItemsCache:new Map(),_searchTerms:[],_blTerms:[],_sortKey:'ct',_sortDir:-1,_filtered:[],
+  document:{getElementById:id=>{if(!elements.has(id))elements.set(id,element(id));return elements.get(id);},querySelector:()=>({id:'tab-items'})},
+  itemMeta:name=>metadata[name]||{},findCollection:()=>'',findEvent:name=>name==='Alpha'?'Event A':'',dispName:v=>v,esc:v=>String(v??''),
+  analyticsForItem:name=>({marketUnitPrice:name==='Alpha'?2:name==='Beta'?20:null}),canonicalPrice:name=>name==='Alpha'?20:name==='Beta'?2:null,
+  cancelMarketItemsRequest(){},updateItemsModeControls(){},requestInventoryAnalytics(){},requestCanonicalNames(){},renderTags(){},itemSortHeader(){return '';},renderItemPresets(){},
+  sortAndRender(){rendered.push({basis:globals._itemsBasis,rows:Array.from(globals._filtered,i=>i[IDX.n])});},
+  itemPresetById(){return{id:'SYNTHETIC-PRESET',name:'Invented preset',filters:globals.preset};},
+ };
+ const context=vm.createContext(globals);
+ new vm.Script(['finiteNum','steamMetricForItem','setSelectIfPresent','applyItemFilterState','selectItemPreset','buildItemsTab','buildCashItemsTab','buildResearchItemsTab','filterItems','filterCashItems','filterResearchItems'].map(fn).join('\n')).runInContext(context);
+ return {context,elements,rendered,metadata,rows:()=>Array.from(context._filtered,i=>i[IDX.n])};
+}
+
+test('saved research preset replay matches v1 positive and negative search and price cases',async()=>{
+ const h=presetReplayHarness(),g=h.context;
+ // Exact expected results were reproduced on published v1 (0e98899). Cash
+ // quotes are deliberately inverted so a basis leak cannot satisfy the test.
+ const cases=[
+  [{searchText:'aLpHa'},['Alpha']],
+  [{searchText:'missing'},[]],
+  [{minPrice:'1',maxPrice:'5'},['Alpha']],
+  [{minPrice:'3',maxPrice:'5'},[]],
+  [{minPrice:'2',maxPrice:'2'},['Alpha']],
+  [{},['Alpha','Beta']],
+ ];
+ for(const [filters,expected]of cases){
+  g.preset={basis:'research',mode:'portfolio',...filters};
+  await g.selectItemPreset('SYNTHETIC-PRESET');
+  assert.deepEqual(h.rows(),expected,JSON.stringify(filters));
+  assert.equal(g._itemsBasis,'research');
+  // A subsequent render/sort must not discard the same saved filters.
+  g.buildItemsTab(g.active.data);assert.deepEqual(h.rows(),expected);
+ }
+ g.active.data.items.push(['Unknown',1,null,null,null,null,'Category A','Rifle']);
+ g.preset={basis:'research',mode:'portfolio'};await g.selectItemPreset('SYNTHETIC-PRESET');assert.deepEqual(h.rows(),['Alpha','Beta','Unknown']);
+ g.preset={basis:'research',mode:'portfolio',minPrice:'1',maxPrice:'5'};await g.selectItemPreset('SYNTHETIC-PRESET');assert.deepEqual(h.rows(),['Alpha']);
+ g.preset={basis:'cash',mode:'portfolio',minPrice:'1',maxPrice:'5'};await g.selectItemPreset('SYNTHETIC-PRESET');assert.deepEqual(h.rows(),['Beta']);
+});
+
+test('research preset rebuild restores metadata options and preserves AND tags and blacklist',async()=>{
+ const h=presetReplayHarness(),g=h.context;
+ // The old cash/scope select has no matching option until research is rebuilt.
+ for(const id of ['item-coll-filter','item-type-filter','item-grade-filter'])g.document.getElementById(id).innerHTML='<option value="">All</option><option value="OLD">Old scope</option>';
+ g.preset={basis:'research',mode:'portfolio',collection:'Collection A',type:'Rifle',grade:'Covert'};
+ await g.selectItemPreset('SYNTHETIC-PRESET');assert.deepEqual(h.rows(),['Alpha']);
+ assert.equal(h.elements.get('item-coll-filter').value,'Collection A');assert.equal(h.elements.get('item-type-filter').value,'Rifle');assert.equal(h.elements.get('item-grade-filter').value,'Covert');
+ g.preset={basis:'research',mode:'portfolio',collection:'Collection A',type:'Pistol'};await g.selectItemPreset('SYNTHETIC-PRESET');assert.deepEqual(h.rows(),[]);
+ g.preset={basis:'research',mode:'portfolio',searchText:'cOvErT',searchTerms:['rifle','event a']};await g.selectItemPreset('SYNTHETIC-PRESET');assert.deepEqual(h.rows(),['Alpha']);
+ g._blTerms=['alpha'];await g.selectItemPreset('SYNTHETIC-PRESET');assert.deepEqual(h.rows(),[]);assert.deepEqual(Array.from(g._blTerms),['alpha']);
+ g._blTerms=[];g.preset={basis:'research',mode:'portfolio',searchTerms:['alpha','missing']};await g.selectItemPreset('SYNTHETIC-PRESET');assert.deepEqual(h.rows(),[]);
+});
+
+test('snapshot A to B inventory race queues B and rejects stale success, error and cleanup',async()=>{
+ const h=presetReplayHarness(),g=h.context,requests=[],statuses=[];
+ Object.assign(g,{_snapshotLoadSeq:0,_globalScale:90,_savedReadGeneration:0,_inventoryAnalytics:{},_inventoryAnalyticsKey:'',_inventoryAnalyticsLoading:false,_inventoryAnalyticsController:null,_inventoryAnalyticsRequestKey:'',_inventoryAnalyticsPromise:null,
+  portfolioCashState:{timer:null,serial:0,generation:0},canonicalCashState:{generation:0},portfolioSteamAskState:{timer:null,readSerial:0,generation:0},_itemCatalog:{},
+  clearTimeout(){},renderPortfolioCash(){},portfolioCashVisible:()=>false,renderPortfolioSteamAskPanel(){},portfolioSteamAskRelevant:()=>false,
+  syncScaleSelect(){},resetOverviewRepairState(){},renderStats(){},renderOverviewMetadataOnly(){},queueCurrentViewRender(){},applySteamSummary(){},
+  renderDataStatus:(coverage,options)=>statuses.push(options),exactTime:()=> 'synthetic-time',console:{warn(){assert.fail('A stale request must not warn or change error status');}},
+  analyticsForItem:name=>g._inventoryAnalytics[name],
+  fetch:(url,options)=>new Promise((resolve,reject)=>requests.push({url,options,resolve,reject})),
+ });
+ g.snaps=[{id:'A',label:'Invented A',data:{items:[['Alpha',1,null,null,null,null,'Category A','Rifle']],totals:{count:1}}},{id:'B',label:'Invented B',data:{items:[['Beta',1,null,null,null,null,'Category B','Pistol']],totals:{count:1}}}];
+ new vm.Script(['researchPeriodDays','analysisQuery','cancelInventoryAnalyticsRequest','requestInventoryAnalytics','indexInventoryAnalytics','loadSnapshot','stopPortfolioSteamAskRead','resetPortfolioSteamAskSelection','stopPortfolioCashRead','resetPortfolioCashSelection','portfolioCashHoldingsKey'].map(fn).join('\n')).runInContext(g);
+ const response=(name,price)=>({ok:true,json:async()=>({items:[{name,marketUnitPrice:price}],coverage:{items:1,dataset:{id:'SYNTHETIC'}}})});
+ await g.loadSnapshot('A');const promiseA=g._inventoryAnalyticsPromise;
+ await g.loadSnapshot('B');const promiseB=g._inventoryAnalyticsPromise,ownerB=g._inventoryAnalyticsController;
+ assert.equal(requests.length,2);assert.equal(new URL(requests[0].url,'https://fixture.invalid').searchParams.get('portfolio'),'A');assert.equal(new URL(requests[1].url,'https://fixture.invalid').searchParams.get('portfolio'),'B');
+ assert.equal(requests[0].options.signal.aborted,true);assert.equal(g.portfolioCashState.portfolioId,'B');assert.equal(g.portfolioSteamAskState.portfolioId,'B');
+ const beforeStale=statuses.length;requests[0].resolve(response('Alpha',999));await promiseA;
+ assert.equal(statuses.length,beforeStale);assert.equal(g._inventoryAnalytics.Alpha,undefined);assert.equal(g._inventoryAnalyticsLoading,true);assert.equal(g._inventoryAnalyticsController,ownerB);assert.equal(g._inventoryAnalyticsRequestKey,'B:90');
+ requests[1].resolve(response('Beta',20));await promiseB;
+ assert.equal(g._inventoryAnalyticsKey,'B:90');assert.equal(g._inventoryAnalytics.Beta.marketUnitPrice,20);assert.equal(g._inventoryAnalytics.Alpha,undefined);assert.equal(g._inventoryAnalyticsLoading,false);assert.deepEqual(h.rows(),['Beta']);
+ // Re-enter A while an older A is still pending: key equality is not ownership.
+ await g.loadSnapshot('A');const oldA=g._inventoryAnalyticsPromise;
+ await g.loadSnapshot('B');const oldB=g._inventoryAnalyticsPromise;
+ await g.loadSnapshot('A');const latestA=g._inventoryAnalyticsPromise,latestOwner=g._inventoryAnalyticsController;
+ assert.equal(requests.length,5);
+ requests[2].resolve(response('Alpha',888));requests[3].reject(new Error('Invented stale error'));await Promise.all([oldA,oldB]);
+ assert.equal(g._inventoryAnalytics.Alpha,undefined);assert.equal(g._inventoryAnalyticsController,latestOwner);assert.equal(g._inventoryAnalyticsLoading,true);
+ requests[4].resolve(response('Alpha',2));await latestA;
+ assert.equal(g._inventoryAnalyticsKey,'A:90');assert.equal(g._inventoryAnalytics.Alpha.marketUnitPrice,2);assert.equal(g._inventoryAnalyticsLoading,false);
+});
+
+test('inherited full-market All period remains zero in requests, caches and selectors',async()=>{
+ const values={};const globals={_globalScale:0,active:{id:'SYNTHETIC'},_itemsBasis:'research',_itemsMode:'market',_marketItemsOffset:0,_searchTerms:[],_blTerms:[],_sortKey:'name',_sortDir:1,URLSearchParams,
+  document:{getElementById:id=>id==='global-scale'?{options:[{value:'90'},{value:'0'}],set value(v){values.scale=v;}}:{value:''}}};
+ const zero=run(['researchPeriodDays','marketItemsQueryState','marketItemsUrl'],'marketItemsUrl()',globals);
+ assert.equal(new URL(zero,'https://fixture.invalid').searchParams.get('days'),'0');
+ const allKey=run(['researchPeriodDays','taxonomyScopeKey'],"taxonomyScopeKey('market')",globals);
+ assert.match(run(['researchPeriodDays','periodOptionHtml'],'periodOptionHtml(0)',globals),/<option value="0" selected>All<\/option>/);
+ run(['syncScaleSelect'],'syncScaleSelect(0)',globals);assert.equal(values.scale,'0');
+ globals._globalScale=90;
+ const ninety=run(['researchPeriodDays','marketItemsQueryState','marketItemsUrl'],'marketItemsUrl()',globals);
+ assert.equal(new URL(ninety,'https://fixture.invalid').searchParams.get('days'),'90');assert.notEqual(allKey,run(['researchPeriodDays','taxonomyScopeKey'],"taxonomyScopeKey('market')",globals));
+ const requests=[];Object.assign(globals,{_savedReadGeneration:0,_taxonomyMarketKey:'',_taxonomyMarketData:null,fetch:async url=>{requests.push(url);return{ok:true,json:async()=>({dimensions:[],marker:new URL(url,'https://fixture.invalid').searchParams.get('days')})};}});
+ const context=vm.createContext(globals);new vm.Script(['researchPeriodDays','taxonomyScopeKey','loadTaxonomyAnalysis'].map(fn).join('\n')).runInContext(context);
+ context._globalScale=0;assert.equal((await context.loadTaxonomyAnalysis('market',false)).marker,'0');
+ context._globalScale=90;assert.equal((await context.loadTaxonomyAnalysis('market',false)).marker,'90');assert.equal(requests.length,2);
+});
+
+test('missing Chart fallback targets canvas for both canvas and context callers',()=>{
+ for(const contextInput of [false,true]){
+  const notes=[];const parent={querySelector:()=>notes[0]||null,appendChild:node=>notes.push(node)};
+  const canvas={hidden:false,parentElement:parent},input=contextInput?{canvas}:canvas;
+  const globals={input,config:{type:'line'},document:{createElement:()=>({})}};
+  run(['createResearchChart'],'createResearchChart(input,config);createResearchChart(input,config)',globals);
+  assert.equal(canvas.hidden,true);assert.equal(notes.length,1);assert.match(notes[0].textContent,/Chart library unavailable/);
+  if(contextInput)assert.equal(Object.hasOwn(input,'hidden'),false);
+  const calls=[];globals.Chart=function(received,config){calls.push({received,config});};
+  run(['createResearchChart'],'createResearchChart(input,config)',globals);
+  assert.equal(canvas.hidden,false);assert.equal(calls[0].received,input);assert.equal(calls[0].config,globals.config);
+ }
 });
 
 test('complete inline script renders research Overview, Items and both group scopes with synthetic DOM/data',async()=>{

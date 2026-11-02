@@ -1338,9 +1338,13 @@ function analysisQuery(){
   if (active && active.id) q += '&portfolio=' + encodeURIComponent(active.id);
   return q;
 }
+function researchPeriodDays(value){
+  var days = Number(value === undefined || value === null || value === '' ? _globalScale : value);
+  return Number.isFinite(days) && days >= 0 ? days : 90;
+}
 function syncScaleSelect(days){
   var el = document.getElementById('global-scale');
-  if (!el || !days) return;
+  if (!el) return;
   var opt = Array.from(el.options).find(function(o){ return Number(o.value) === Number(days); });
   if (opt) el.value = String(days);
 }
@@ -1772,7 +1776,7 @@ async function init(){
 
 // -- TABS -------------------------------------------------------------
 function overviewKey(){
-  return (active && active.id ? active.id : '') + ':' + (_globalScale || 90);
+  return (active && active.id ? active.id : '') + ':' + (researchPeriodDays());
 }
 
 function resetOverviewRepairState(){
@@ -1875,6 +1879,7 @@ async function loadSnapshot(id, opts){
   var referenceStatus = document.getElementById('saved-reference-status');
   if (referenceStatus) referenceStatus.textContent = 'Uses saved provider quotes only; no market fetch.';
   active=snaps.find(s=>s.id===id)||snaps[0];
+  cancelInventoryAnalyticsRequest();
   resetPortfolioSteamAskSelection();
   resetPortfolioCashSelection();
   document.getElementById('snap-select').value=active.id;
@@ -2729,19 +2734,30 @@ async function recomputeSavedReference(){
   }
 }
 
+function cancelInventoryAnalyticsRequest(){
+  var controller = _inventoryAnalyticsController;
+  _inventoryAnalyticsController = null;
+  _inventoryAnalyticsRequestKey = '';
+  _inventoryAnalyticsPromise = null;
+  _inventoryAnalyticsLoading = false;
+  if (controller) controller.abort();
+}
+
 async function requestInventoryAnalytics(opts){
   opts = opts || {};
   var key = (active && active.id ? active.id : '') + ':' + _globalScale;
   var generation = _savedReadGeneration, requestedPortfolio = active && active.id;
-  if (_inventoryAnalyticsLoading) {
-    var running = _inventoryAnalyticsPromise;
-    if (!opts.force) return running;
-    if (running) {
-      try { await running; } catch(e) {}
-    }
-  }
+  if (!opts.force && _inventoryAnalyticsLoading && _inventoryAnalyticsRequestKey === key && _inventoryAnalyticsPromise) return _inventoryAnalyticsPromise;
   if (!opts.force && _inventoryAnalyticsKey === key) return;
+  cancelInventoryAnalyticsRequest();
+  var controller = new AbortController();
+  _inventoryAnalyticsController = controller;
+  _inventoryAnalyticsRequestKey = key;
   _inventoryAnalyticsLoading = true;
+  function ownsRequest(){
+    return _inventoryAnalyticsController === controller && generation === _savedReadGeneration
+      && active && active.id === requestedPortfolio && key === active.id+':'+_globalScale;
+  }
   var runPromise = (async function(){
   renderDataStatus(null, {loading:true, message:'Reading shared market cache and '+_globalScale+'d volatility rows...'});
   try {
@@ -2749,22 +2765,23 @@ async function requestInventoryAnalytics(opts){
     if (opts.refresh) q += '&refresh=1&refresh_limit=' + encodeURIComponent(opts.refreshLimit || 25);
     if (opts.refreshHistory) q += '&refresh_history=1&history_limit=' + encodeURIComponent(opts.historyLimit || 10);
     if (opts.force) q += '&force=1';
-    var r = await fetch('/api/inventory' + q);
+    var r = await fetch('/api/inventory' + q, {signal:controller.signal});
     if (!r.ok) throw new Error('HTTP '+r.status);
     var data = await r.json();
-    if (generation !== _savedReadGeneration || !active || active.id !== requestedPortfolio || key !== active.id+':'+_globalScale) return;
+    if (!ownsRequest()) return;
     var cov = data.coverage || {};
     var ds = cov.dataset || {};
-    renderDataStatus(cov, {message:'Local cache dataset '+(ds.id || 'portfolio observed cache')+' as of '+exactTime(ds.asOf || Math.max(cov.latestQuoteAt || 0, cov.latestHistoryTs || 0))+': '+(cov.items || 0).toLocaleString()+' portfolio items. Window '+(_globalScale || 90)+'d changes only prior/reference and volatility fields.'});
+    renderDataStatus(cov, {message:'Local cache dataset '+(ds.id || 'portfolio observed cache')+' as of '+exactTime(ds.asOf || Math.max(cov.latestQuoteAt || 0, cov.latestHistoryTs || 0))+': '+(cov.items || 0).toLocaleString()+' portfolio items. Window '+(researchPeriodDays())+'d changes only prior/reference and volatility fields.'});
     _inventoryAnalytics = indexInventoryAnalytics(data.items || []);
     _inventoryAnalyticsKey = key;
     applySteamSummary();
     if (document.getElementById('tab-overview').classList.contains('active') && active.data) renderOverview(active.data);
     if (document.getElementById('tab-categories').classList.contains('active') && active.data) buildBreakdown(active.data);
     if (document.getElementById('tab-market').classList.contains('active') && _marketAnalysis) renderMarketAnalysis(_marketAnalysis);
-    if (document.getElementById('tab-items').classList.contains('active') && active.data) sortAndRender();
+    if (document.getElementById('tab-items').classList.contains('active') && active.data) filterItems();
     return data;
   } catch(e) {
+    if (!ownsRequest() || e.name === 'AbortError') return;
     console.warn('inventory analytics failed:', e.message);
     renderDataStatus(null, {error:true, message:'Shared market cache load failed: '+e.message});
   }
@@ -2773,9 +2790,11 @@ async function requestInventoryAnalytics(opts){
   try {
     return await runPromise;
   } finally {
-    if (_inventoryAnalyticsPromise === runPromise) {
+    if (_inventoryAnalyticsController === controller && _inventoryAnalyticsPromise === runPromise) {
       _inventoryAnalyticsLoading = false;
       _inventoryAnalyticsPromise = null;
+      _inventoryAnalyticsController = null;
+      _inventoryAnalyticsRequestKey = '';
     }
   }
 }
@@ -2811,7 +2830,7 @@ async function requestPortfolioCurve(opts){
     opts = Object.assign({},opts,{refresh:false,forceSteam:false});
   }
   var daysEl = document.getElementById('overview-curve-days');
-  var curveDays = daysEl ? Number(daysEl.value) : Number(_globalScale || 90);
+  var curveDays = daysEl ? Number(daysEl.value) : Number(researchPeriodDays());
   if (!Number.isFinite(curveDays)) curveDays = 90;
   var key = (active && active.id ? active.id : '') + ':' + curveDays;
   if (!opts.force && (_portfolioCurveKey === key || _portfolioCurveLoading)) return;
@@ -2843,7 +2862,7 @@ async function requestPortfolioCurve(opts){
     }
     if (!requestCurrent) return;
     var currentDaysEl = document.getElementById('overview-curve-days');
-    var currentDays = currentDaysEl ? Number(currentDaysEl.value) : Number(_globalScale || 90);
+    var currentDays = currentDaysEl ? Number(currentDaysEl.value) : Number(researchPeriodDays());
     if (!Number.isFinite(currentDays)) currentDays = 90;
     var currentKey = (active && active.id ? active.id : '') + ':' + currentDays;
     if (currentKey !== key) return;
@@ -3058,7 +3077,7 @@ function renderPortfolioCurveCard(hasItems){
   if (coverage.backfilledCurrentItems) itemLabel += ' / '+Number(coverage.backfilledCurrentItems || 0).toLocaleString()+' current-price backfilled';
   if (_portfolioCurveWarmPending) itemLabel += ' / warming raw Steam charts';
   if (coverage.carriedForwardPoints) itemLabel += ' / dashed where carried forward';
-  itemLabel += ' / ' + (((_portfolioCurve || {}).historyDays) || (document.getElementById('overview-curve-days').value || _globalScale || 90)) + 'd window';
+  itemLabel += ' / ' + (((_portfolioCurve || {}).historyDays) || (document.getElementById('overview-curve-days').value || researchPeriodDays())) + 'd window';
   sub.textContent = itemLabel;
   var labels = points.map(function(p){ return historyDateLabel((p.ts || 0) * 1000); });
   var values = points.map(function(p){ return Number(p.value || 0); });
@@ -3364,11 +3383,7 @@ function invalidateSavedReadCaches() {
   _marketDetails = Object.create(null);
   Object.keys(_steamHistoryLoading).forEach(function(id){ _steamHistoryLoading[id].abort(); });
   _steamHistoryLoading = {};
-  if (_inventoryAnalyticsController) _inventoryAnalyticsController.abort();
-  _inventoryAnalyticsController = null;
-  _inventoryAnalyticsLoading = false;
-  _inventoryAnalyticsPromise = null;
-  _inventoryAnalyticsRequestKey = '';
+  cancelInventoryAnalyticsRequest();
   _inventoryAnalyticsKey = '';
 }
 
@@ -3490,6 +3505,9 @@ function applyItemFilterState(filters) {
   _itemsBasis=filters.basis==='cash'?'cash':'research'; _marketItemsOffset=0;
   cancelMarketItemsRequest();_marketItemsKey='';_marketItemsCache.clear();
   document.getElementById('items-container').innerHTML='';
+  var researchPortfolio = _itemsBasis === 'research' && _itemsMode === 'portfolio';
+  // Populate the selected basis' metadata options before restoring the preset.
+  if (researchPortfolio) buildResearchItemsTab(active && active.data || {items:[]}, true);
   _searchTerms = Array.isArray(filters.searchTerms) ? filters.searchTerms.slice() : [];
   renderTags('search');
   var search = document.getElementById('item-search');
@@ -3503,7 +3521,8 @@ function applyItemFilterState(filters) {
   if (maxEl) maxEl.value = filters.maxPrice || '';
   _sortKey = filters.sortKey || (_itemsMode === 'market' ? 'movementScore' : 'ct');
   _sortDir = Number(filters.sortDir) || -1;
-  buildItemsTab(active && active.data || {items:[]});
+  if (researchPortfolio) filterResearchItems();
+  else buildItemsTab(active && active.data || {items:[]});
 }
 
 async function selectItemPreset(id) {
@@ -4688,7 +4707,7 @@ function marketItemsQueryState() {
     basis: _itemsBasis,
     offset: String(_marketItemsOffset),
     projection: 'market-table-v1',
-    days: String(_globalScale || 90),
+    days: String(researchPeriodDays()),
     search: document.getElementById('item-search').value || '',
     terms: _searchTerms.join('|'),
     blacklist: _blTerms.join('|'),
@@ -4728,7 +4747,7 @@ function marketItemsUrl() {
 }
 
 async function loadMarketItems(force) {
-  var windowKey = String(_globalScale || 90);
+  var windowKey = String(researchPeriodDays());
   var key = marketItemsQueryKey();
   var promiseKey = windowKey + ':' + key;
   if (!force && _marketItemsLoading && _marketItemsPromise && _marketItemsPromiseKey === promiseKey) return _marketItemsPromise;
@@ -6267,7 +6286,7 @@ let _mkReturnChart = null;
 let _overviewSectorPriceChart = null;
 let _overviewSectorReturnChart = null;
 
-function taxonomyScopeKey(scope){ return scope + ':' + (active && active.id ? active.id : '') + ':' + (_globalScale || 90); }
+function taxonomyScopeKey(scope){ return scope + ':' + (active && active.id ? active.id : '') + ':' + (researchPeriodDays()); }
 function taxonomyMetricValue(group, rank){ var v = group ? group[rank] : null; return Number.isFinite(Number(v)) ? Number(v) : 0; }
 function taxonomyChartValue(point){ var v = point ? Number(point.value) : NaN; return Number.isFinite(v) ? v : null; }
 function taxonomyMoneyTick(v){ return '$' + Number(v || 0).toLocaleString('en-US', {maximumFractionDigits:0}); }
@@ -6733,7 +6752,7 @@ async function loadTaxonomyAnalysis(scope, force){
 async function loadGroupHistory(scope, dimension, group, days, opts){
   var generation = _savedReadGeneration;
   opts = opts || {};
-  days = Number.isFinite(Number(days)) ? Number(days) : Number(_globalScale || 90);
+  days = Number.isFinite(Number(days)) ? Number(days) : Number(researchPeriodDays());
   var cacheKey = [scope, active && active.id || '', days, dimension, group].join(':');
   if (_taxonomyHistoryCache[cacheKey] && !opts.warm) return _taxonomyHistoryCache[cacheKey];
   var url = '/api/group-history?scope=' + encodeURIComponent(scope)
@@ -6754,7 +6773,7 @@ async function loadGroupHistory(scope, dimension, group, days, opts){
 }
 async function loadGroupItemHistory(scope, dimension, group, days){
   var generation = _savedReadGeneration;
-  days = Number.isFinite(Number(days)) ? Number(days) : Number(_globalScale || 90);
+  days = Number.isFinite(Number(days)) ? Number(days) : Number(researchPeriodDays());
   var cacheKey = ['itemLines', scope, active && active.id || '', days, dimension, group].join(':');
   if (_taxonomyHistoryCache[cacheKey]) return _taxonomyHistoryCache[cacheKey];
   var url = '/api/group-item-history?scope=' + encodeURIComponent(scope)
@@ -6902,7 +6921,7 @@ function breakdownRow(g){
 }
 
 function periodOptionHtml(selected){
-  selected = String(selected || _globalScale || 90);
+  selected = String(researchPeriodDays(selected));
   return [
     ['7','7d'], ['30','30d'], ['90','90d'], ['180','180d'], ['365','1y'], ['0','All']
   ].map(function(opt){
@@ -7012,7 +7031,7 @@ async function buildMarketAnalysis(){
   var hasMarketData = !!(_marketBkData && _marketBkData.source && _marketBkData.source.length);
   if (loading) loading.style.display = hasMarketData ? 'none' : '';
   if (content) content.style.display = hasMarketData ? '' : 'none';
-  renderMarketDataStatus(null, {loading:true, message: hasMarketData ? 'Keeping the current full-market basket visible while recomputing '+(_globalScale || 90)+'d metrics.' : 'Loading full-market basket analysis...'});
+  renderMarketDataStatus(null, {loading:true, message: hasMarketData ? 'Keeping the current full-market basket visible while recomputing '+(researchPeriodDays())+'d metrics.' : 'Loading full-market basket analysis...'});
   try {
     var data = await loadTaxonomyAnalysis('market', false);
     if (!data || !data.dimensions || !data.dimensions.length) throw new Error('No market dimensions returned');
@@ -7244,7 +7263,7 @@ function breakdownDetailHtml(scope, r, id){
   return '<div class="bk-detail-grid">'+stats+'</div>'
     + '<div style="margin-top:14px"><div class="card-title" style="margin-bottom:8px">Value Over Period <span class="card-sub">x=time, y=$ group value; cleaned/interpolated from raw Steam chart history, dashed/carried status shown below</span></div><div class="bk-mover-meta" id="'+id+'-value-status" style="margin-bottom:8px">Loading group value curve...</div><div class="chart-wrap-md"><canvas id="'+id+'-value-chart"></canvas></div></div>'
     + '<div class="bk-detail-layout">'
-    + '<div><div class="card-title" style="margin-bottom:8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">Highest Volatility Items <span class="card-sub">indexed Steam movement lines ranked across 7d / 30d / 90d volatility</span><select class="search-select" id="'+id+'-days" onchange="loadBreakdownDetailChart(\''+scope+'\',\''+id+'\')" onclick="event.stopPropagation()" style="width:86px">'+periodOptionHtml(_globalScale || 90)+'</select></div><div class="bk-mover-meta" id="'+id+'-chart-status" style="margin-bottom:8px">Loading item history lines...</div><div class="bk-detail-chart"><canvas id="'+id+'-chart"></canvas></div></div>'
+    + '<div><div class="card-title" style="margin-bottom:8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">Highest Volatility Items <span class="card-sub">indexed Steam movement lines ranked across 7d / 30d / 90d volatility</span><select class="search-select" id="'+id+'-days" onchange="loadBreakdownDetailChart(\''+scope+'\',\''+id+'\')" onclick="event.stopPropagation()" style="width:86px">'+periodOptionHtml(researchPeriodDays())+'</select></div><div class="bk-mover-meta" id="'+id+'-chart-status" style="margin-bottom:8px">Loading item history lines...</div><div class="bk-detail-chart"><canvas id="'+id+'-chart"></canvas></div></div>'
     + '<div><div class="card-title" style="margin-bottom:8px">Representative Movers <span class="card-sub">provider prices plus multi-window volatility</span></div><div id="'+id+'-movers">'+breakdownMoversHtml(r)+'</div></div>'
     + '</div>';
 }
@@ -7390,7 +7409,7 @@ function loadBreakdownDetailChart(scope, id){
   var canvas = document.getElementById(canvasId);
   if (!canvas) return;
   var daysEl = document.getElementById(id + '-days');
-  var days = daysEl ? Number(daysEl.value) : Number(_globalScale || 90);
+  var days = daysEl ? Number(daysEl.value) : Number(researchPeriodDays());
   if (!Number.isFinite(days)) days = 90;
   loadBreakdownValueCurve(scope, row, id, days);
   var chartKey = scope + ':' + row.dimension + ':' + row.name + ':' + days;
@@ -7574,7 +7593,7 @@ function buildCashItemsTab(data) {
   }
   filterItems();
 }
-function buildResearchItemsTab(data) {
+function buildResearchItemsTab(data, deferFilters) {
   updateItemsModeControls();
   if (_itemsMode === 'market') {
     buildMarketItemsTab(false);
@@ -7637,22 +7656,7 @@ function buildResearchItemsTab(data) {
     + '</tr></thead>'
     + '<tbody id="items-tbody"></tbody></table></div>';
 
-  _filtered = data.items.filter(function(i) {
-    var n = i[IDX.n].toLowerCase();
-    var meta = itemMeta(i[IDX.n]);
-    var itemColl = meta.collection || findCollection(i[IDX.n]);
-    var hay = [i[IDX.n], itemColl, meta.rarity, meta.weapon, meta.type, i[IDX.cat], i[IDX.grp], findEvent(i[IDX.n])]
-      .filter(Boolean).join(' ').toLowerCase();
-    if (_blTerms.length && _blTerms.some(function(t){ return n.includes(t); })) return false;
-    if (_searchTerms.length && !_searchTerms.every(function(t){ return hay.includes(t); })) return false;
-    return true;
-  });
-  if (_itemsMode === 'market') {
-    _marketItemsKey = '';
-    buildMarketItemsTab(true);
-    return;
-  }
-  sortAndRender();
+  if (!deferFilters) filterResearchItems();
 }
 function filterCashItems() {
   _marketItemsOffset=0;
@@ -8322,8 +8326,9 @@ async function requestCurrentItemEvidence(name,el){
 setInterval(function(){if(!document.hidden)requestCurrentAnalysis(false);},15000);
 
 function createResearchChart(canvas,config){
-  if(typeof Chart==='function'){if(canvas)canvas.hidden=false;return new Chart(canvas,config);}
-  if(canvas){canvas.hidden=true;var parent=canvas.parentElement;if(parent&&!parent.querySelector('.chart-dependency-note')){var note=document.createElement('p');note.className='chart-dependency-note card-sub';note.textContent='Chart library unavailable; research tables and source coverage remain usable.';parent.appendChild(note);}}
+  var element = canvas && (canvas.canvas || canvas);
+  if(typeof Chart==='function'){if(element)element.hidden=false;return new Chart(canvas,config);}
+  if(element){element.hidden=true;var parent=element.parentElement;if(parent&&!parent.querySelector('.chart-dependency-note')){var note=document.createElement('p');note.className='chart-dependency-note card-sub';note.textContent='Chart library unavailable; research tables and source coverage remain usable.';parent.appendChild(note);}}
   return {destroy:function(){},update:function(){}};
 }
 function setItemsBasis(value){
