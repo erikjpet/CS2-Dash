@@ -75,7 +75,7 @@ register('NAV-01/03,DAT-03..05,OV-02..12','Tabs, research periods, widgets and e
  await tab('Overview');await inventorySettled();
  await page.waitForFunction(()=>typeof Chart==='function'&&!!Chart.getChart(document.getElementById('pie-chart')),null,{timeout:9000});
  assert.deepEqual(await page.locator('#global-scale option').evaluateAll(options=>options.map(o=>o.value)),['1','3','7','30','90','180','365','0']);
- for(const period of ['7','30','90']){await page.locator('#global-scale').selectOption(period);await inventorySettled();}
+ for(const period of ['7','30','90','0','90']){await page.locator('#global-scale').selectOption(period);await inventorySettled();}
  for(const period of ['7','90']){await page.locator('#overview-curve-days').selectOption(period);await page.waitForFunction(()=>!_portfolioCurveLoading&&_portfolioCurve&&_portfolioCurve.points?.length>1);}
  for(const id of ['overview-action-brief','overview-risk-controls','overview-rankings'])await expectText('#'+id,/\S/);
  for(const id of ['ov-return-top','ov-return-bottom','ov-return-split'])await page.locator('#'+id).click();
@@ -83,9 +83,12 @@ register('NAV-01/03,DAT-03..05,OV-02..12','Tabs, research periods, widgets and e
  await page.locator('#data-task-mode').selectOption('provider_snapshots');
  await page.locator('#data-pull-mode').selectOption('gentle');
  await page.locator('#data-history-limit').fill('0');await page.locator('#data-task-cycles').fill('1');
+ await page.locator('#data-retry-failures').uncheck();assert.equal(await page.locator('#data-retry-failures').isChecked(),false);
+ await page.locator('#data-retry-failures').check();assert.equal(await page.locator('#data-retry-failures').isChecked(),true);
  assert.equal(await page.locator('#data-task-mode').inputValue(),'provider_snapshots');
+ assert.equal(await page.locator('#data-task-start-btn').textContent(),'Start Background Fill');
  await page.locator('.logo-text h1').click();
- return {tabsActivated:5,globalPeriodsExercised:['7','30','90'],curvePeriodsExercised:['7','90'],returnModesExercised:3,acquisition:'controls exercised; no job requested because fixture forbids providers'};
+ return {tabsActivated:5,globalPeriodsExercised:['7','30','90','0'],curvePeriodsExercised:['7','90'],returnModesExercised:3,acquisition:'controls exercised; no job requested because fixture forbids providers'};
 });
 register('OV-07,IO-09','Decision note survives a real page reload',async()=>{
  await tab('Overview');const note='SYNTHETIC browser acceptance note';
@@ -133,7 +136,7 @@ register('IT-01/10/11/14/16','Research/cash bases in both portfolio and catalog 
  const evidence=[];
  for(const basis of ['research','cash'])for(const mode of ['portfolio','market']){
   await items(basis,mode);await clearFilters();
-  const headers=await page.locator('#items-table thead').innerText();
+  const headers=await page.locator('#items-table thead').textContent();
   assert.ok(headers.includes(basis==='research'?'Provider benchmark':'Cash price'));
   if(basis==='research')assert.ok(headers.includes('Move %')&&headers.includes('CSFloat'));
   assert.ok(await page.locator('#items-tbody .item-main-row').count()>0);
@@ -235,6 +238,14 @@ register('UX-01..06','320/390/768 mobile geometry, local table scroll and synthe
  await page.setViewportSize({width:1280,height:900});return {viewports:geometry};
 });
 
+const selectedNumbers=(process.env.CS2_V1_BROWSER_CASES||'').split(',').filter(Boolean).map(Number);
+assert.ok(selectedNumbers.every(n=>Number.isInteger(n)&&n>=1&&n<=cases.length),'Requested browser case is outside the finite plan');
+assert.equal(new Set(selectedNumbers).size,selectedNumbers.length,'Duplicate browser case selection');
+const plannedCases=cases.map((item,index)=>({...item,number:index+1})).filter(item=>!selectedNumbers.length||selectedNumbers.includes(item.number));
+report.registeredCases=cases.length;
+report.selectedCases=plannedCases.map(item=>({number:item.number,id:item.id}));
+report.scope=selectedNumbers.length?'selected cases only':'complete prepared browser plan';
+
 try{
  const launchBudget=Math.min(15000,deadline-Date.now());assert.ok(launchBudget>1000,'No browser startup budget remains');
  browser=await chromium.launch({headless:true,chromiumSandbox:true,timeout:launchBudget,args:['--renderer-process-limit=1','--js-flags=--max-old-space-size=256']});
@@ -256,10 +267,10 @@ try{
  });
  page=await context.newPage();
  await page.goto(base.href,{waitUntil:'domcontentloaded',timeout:15000});await ready();
- for(const item of cases){
-  if(Date.now()>deadline-3000||report.budgetExceeded){report.cases.push({id:item.id,title:item.title,status:'not_run_budget'});continue;}
-  const tick=Date.now();try{const evidence=await item.run();report.cases.push({id:item.id,title:item.title,status:'passed',milliseconds:Date.now()-tick,evidence});}
-  catch(error){const failure={id:item.id,title:item.title,status:'failed',milliseconds:Date.now()-tick,error:String(error.message).slice(0,1400)};report.cases.push(failure);
+ for(const item of plannedCases){
+  if(Date.now()>deadline-3000||report.budgetExceeded){report.cases.push({number:item.number,id:item.id,title:item.title,status:'not_run_budget'});continue;}
+  const tick=Date.now();try{const evidence=await item.run();report.cases.push({number:item.number,id:item.id,title:item.title,status:'passed',milliseconds:Date.now()-tick,evidence});}
+  catch(error){const failure={number:item.number,id:item.id,title:item.title,status:'failed',milliseconds:Date.now()-tick,error:String(error.message).slice(0,1400)};report.cases.push(failure);
    try{const file='synthetic-failure-'+report.cases.length+'.png';await page.screenshot({path:path.join(output,file),timeout:3000});report.screenshots.push(file);}catch{}
    if(!report.budgetExceeded)try{await page.goto(base.href,{waitUntil:'domcontentloaded',timeout:7000});await ready();}catch{}
   }
@@ -270,7 +281,7 @@ finally{
  clearTimeout(hardStop);try{await context?.close();}catch{}
  try{await browser?.close();report.browserCloseConfirmed=true;}catch(error){report.browserCloseConfirmed=false;report.browserCloseError=String(error.message).slice(0,300);}
  report.finishedAt=new Date().toISOString();report.elapsedMilliseconds=Date.now()-started;
- report.status=report.browserCloseConfirmed&&!report.harnessError&&!report.budgetExceeded&&report.pageErrors.length===0&&report.cases.length===cases.length&&report.cases.every(c=>c.status==='passed')?'passed':'incomplete_or_failed';
+ report.status=report.browserCloseConfirmed&&!report.harnessError&&!report.budgetExceeded&&report.pageErrors.length===0&&report.cases.length===plannedCases.length&&report.cases.every(c=>c.status==='passed')?'passed':'incomplete_or_failed';
  await fs.writeFile(path.join(output,'results.json'),JSON.stringify(report,null,2)+'\n');
  console.log(JSON.stringify({status:report.status,cases:report.cases.length,passed:report.cases.filter(c=>c.status==='passed').length,output,elapsedMilliseconds:report.elapsedMilliseconds,browserCloseConfirmed:report.browserCloseConfirmed}));
 }

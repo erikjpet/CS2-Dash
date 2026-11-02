@@ -1,23 +1,23 @@
 # CS2-04 — Version-one feature parity matrix
 
-Updated 2026-11-02. **The focused cloud findings below are repaired and 97 portable application checks pass. Browser acceptance and live verification remain pending. CS2-04 is not complete.**
+Updated 2026-11-02. **UI01 completed with seven passing and five failing macro cases. The application fixes and harness correction below are source-ready; their focused browser rerun and live verification remain pending. CS2-04 is not complete.**
 
 This is the canonical delivery matrix for all **74** intake IDs. The original audited-live findings and line references are preserved in [the intake inventory](../tools/CS2-04-control-parity.md). “Audited live” below means that unchanged intake, not the isolated restoration. No initial missing/hidden finding is silently relabelled as a live repair.
 
 ## Baseline and stages
 
-There is no GitHub Release or tag for v1. The original v1.0 commit is `de8a469184d4802c536a8937c7d945f021a26314`; the later published v1 fixes through `0e98899ef060742fcec8acd1ce22d03a728f18dc` are included. See [verified baseline](V1-BASELINE.md). The audited live HTML SHA256 was `d927bb422cab87008429378f5938d9a3c9da634ab9a4b38c657ec7ca020dff5e`; isolated restored frontend SHA256 is `2c359d4c8b21a7b69a34da46158fc74776af2b2108b6aa6bdfa469c1ea738d4a`.
+There is no GitHub Release or tag for v1. The original v1.0 commit is `de8a469184d4802c536a8937c7d945f021a26314`; the later published v1 fixes through `0e98899ef060742fcec8acd1ce22d03a728f18dc` are included. See [verified baseline](V1-BASELINE.md). The audited live HTML SHA256 was `d927bb422cab87008429378f5938d9a3c9da634ab9a4b38c657ec7ca020dff5e`; isolated restored frontend SHA256 is `49654018908439ba83aa9b2d95e478a54acd8f52aac76a53df352b5e5ea41d45`.
 
 | Stage | Verified state |
 | --- | --- |
 | Source | Research scope/widgets/routes restored alongside current cash functionality in isolated CS2 worktree. All 10 metric windows are materialized by explicit refresh. Warm/Sync use the continuing tracked job with selected-portfolio scope. |
-| Portable tests | **97** application checks: `tests` 17, `tools` 55 (36 runtime + 19 recovery), frontend Node 25. **9** unchanged site checks: runtime profile 5 and sync 4. Root syntax checks passed for 37 Python root files, root MJS files and the PowerShell launcher. |
-| Browser | **Pending for every row.** Prepared real-browser invented-data cases B1–B12; no restoration browser/listener run claimed. See [acceptance runner](../tools/V1-BROWSER-ACCEPTANCE.md). |
+| Portable tests | **100** component checks: 28 current frontend Node cases plus the unchanged 17 API/runtime and 55 runtime/recovery cases. **9** unchanged site checks: runtime profile 5 and sync 4. Syntax checks cover root Python/MJS, the browser runner and PowerShell launcher. |
+| Browser | **UI01 executed:** 7/12 macro cases passed on `7524344`; partial evidence and five failures are mapped below. No page exceptions occurred. Cases 1,6,7,9,12 are prepared for a focused repeat on the repaired candidate. See [acceptance runner](../tools/V1-BROWSER-ACCEPTANCE.md). |
 | Published | **Confirmed to existing main branches:** CS2 implementation `e7894fe94e297aa442566724cf7acc318b29539d`; guarded site integration `b827906cd32d04c1c822e0eef581b47acd796cde`. Both remote identities were verified after consecutive publication. Later checkpoint-documentation commits do not alter this implementation. |
 | Live | **Pending for every row.** No source/data promotion or service restart performed for this restoration. |
 | Full v1 parity | **Open.** Source/test coverage is not proof that every click, real dataset and upstream prerequisite works in the deployed service. |
 
-Evidence keys: **F** = [25 frontend Node checks](../tools/frontend_restore.test.mjs), including synthetic DOM rendering (not a browser); **A** = [12 actual Handler/SQLite parity cases](../tests/test_v1_parity.py); **R** = [36 runtime tests](../tools/test_restoration_runtime.py), using synthetic acquisition/fake clocks where stated; **D** = [19 recovery tests](../tools/test_research_recovery.py). The other five application checks cover Node runtime selection and public build identity. These are portable execution receipts; they do not claim a browser run or live deployment.
+Evidence keys: **F** = [28 frontend Node checks](../tools/frontend_restore.test.mjs), including synthetic DOM rendering (not a browser); **A** = [12 actual Handler/SQLite parity cases](../tests/test_v1_parity.py); **R** = [36 runtime tests](../tools/test_restoration_runtime.py), using synthetic acquisition/fake clocks where stated; **D** = [19 recovery tests](../tools/test_research_recovery.py). The other five application checks cover Node runtime selection and public build identity. Portable evidence, the actual UI01 ledger below and future live verification are distinct stages.
 
 ## Data, acquisition and baseline limits
 
@@ -27,6 +27,36 @@ Evidence keys: **F** = [25 frontend Node checks](../tools/frontend_restore.test.
 - Legacy identity/name/quantity rows match the current backup. Every old imported benchmark/percentage/return field is null in both sources. Those numeric values cannot be recovered from these files; null is unavailable, not zero.
 - The published v1 `portfolio_analysis`/`full_report` already had empty signal/category/window/series placeholders. This restoration reconnects existing sections/appendix truthfully; it does not invent trading algorithms and call them original v1 functionality.
 - Current cash quote ledger, provenance, provider control and pricing/freshness improvements remain separate from research benchmarks. Real personal data and private recovery artifacts remain local, outside Git and source/test bundles.
+
+## Actual browser ledger: UI01
+
+UI01 used exact application source `7524344fd9e1998c04d52525ec49968a2b3aecc8`,
+real sandboxed Chromium, invented fixture data and a 12% CPU/2 GiB owned job.
+It finished in 49.5 seconds with zero page errors. All eight observed owned PIDs
+exited; port8097 closed and temporary fixture data was cleaned. Peak sampled job
+memory was717,471,744 bytes. Existing live source, service and user data were not
+changed. Screenshots and detailed receipts remain in the local QA run directory.
+
+| Case | Actual evidence | Classification and next acceptance |
+| --- | --- | --- |
+| B1 | Tabs, real charts,7/30/90 research periods,7/90 curves and return modes worked; selecting the job strategy failed. | App: five job-field wrappers retained `hidden`; research action was labelled as cash refresh. Wrappers/label repaired while retaining owner guards. Repeat visible fields/label. |
+| B2 | Decision note survived an actual reload. | Passed. |
+| B3 | Preset add/select/rename/delete and stored cleanup worked. | Passed CRUD; filter semantics also have the separate cloud/VM replay evidence above. |
+| B4 | Portfolio lenses, eight sorts, group curve and7-day item drill-down worked. | Passed these exercised flows; unexercised controls remain open. |
+| B5 | Independent full-market lenses, eight sorts, group curve and7-day item drill-down worked. | Passed these exercised flows. |
+| B6 | Header assertion failed before the four basis/scope combinations could finish. | Harness: CSS uppercased `innerText`. Read DOM text content; repeat actual headers/details without weakening basis checks. |
+| B7 | Research global price ordering, bounds and pagination worked. Cash cheap-item ordering failed. | App: cached-quote sorting displaced new server-ranked cheap rows. Preserve global server order during hydration and refresh the page once on actual revision changes; repeat beyond-500 proof in both bases. |
+| B8 | Two AND tags, collection/type/grade filters and inline narrowing worked. | Passed. |
+| B9 | Actual null-safe TXT download worked; two-holding paste preview failed. | Inherited ten-item generic-import restriction. Native-v2 exports now accept one or more validated rows; generic heuristics retained. Repeat the actual two-holding round trip. |
+| B10 | CSV upload, duplicate collapse/merge, preview and invented-portfolio save worked. | Passed; generic-import threshold remains unchanged by the native-v2 repair. |
+| B11 | Saved snapshot View, History canvas visibility, report sections and deletion of the invented import worked. | Passed exercised controls. No numeric historical benchmark curve is claimed from null benchmark fields. |
+| B12 |320/390px header and reachable table scrolling worked;768px header fit failed. | App: tablet wrapping gap. Targeted<=900px header/tabs wrapping repaired; repeat768 and affected320/390 geometry. |
+
+Normal-entry-point stop qualification and fresh-data cutover were not run in
+UI01. They remain separate finite phases; source repair is not a retroactive UI
+pass. The focused rerun selects B1/B6/B7/B9/B12 and keeps UI01's seven passing
+macro results. Per-row B1-B12 references below use this ledger; an earlier
+"pending" note must not be read as a new pass for an unexercised subflow.
 
 ## Feature matrix
 

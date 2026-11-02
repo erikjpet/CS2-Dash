@@ -44,3 +44,26 @@ Screenshots capture the viewport rather than rendering every row of a 500-item t
 `results.json` records each case separately as passed, failed or not run because the budget expired. A failing case does not silently count later work as complete. Any page exception, harness error, budget expiry or nonpassing case prevents an overall passed result. A dependency/CDN failure is reported as an incomplete chart check, not disguised by a fake chart library.
 
 Preparation checks: `node --check tools/v1_browser_acceptance.mjs`. This is syntax validation only, not browser acceptance.
+
+## UI01 and the finite failed-case rerun
+
+The first actual run used commit `7524344fd9e1998c04d52525ec49968a2b3aecc8`.
+It completed in 49.5 seconds: seven macro cases passed and five failed. Its
+owned browser/fixture processes exited, the listener closed and temporary data
+was cleaned. Preserve that run's results; source changes do not turn a previous
+failure into a pass.
+
+Set `CS2_V1_BROWSER_CASES=1,6,7,9,12` for the focused follow-up. The report records
+the selected case numbers, registered total and selected-only scope; a successful
+subset is not represented as a new complete twelve-case run. The retained cases
+exercise visible job controls, both item bases/scopes, beyond-500 global sorting
+and paging, the actual two-holding native TXT download/reimport, and 768px header
+geometry with affected 320/390px layout regression checks. Header assertions use
+DOM text content so uppercase CSS cannot produce a false label failure.
+
+Use an exact clean Git snapshot for both the browser run and a separate normal
+`server.py` startup/stop-marker qualification. The latter uses empty invented
+state on loopback8098 with provider network disabled; it must prove a clean exit,
+closed listener, matching code identity, intact temporary databases and zero
+provider attempts. Each phase retains its own owned-job and cleanup receipt.
+Neither phase changes the existing live service or promotes user data.

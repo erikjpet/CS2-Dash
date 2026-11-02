@@ -306,6 +306,72 @@ test('missing Chart fallback targets canvas for both canvas and context callers'
  }
 });
 
+test('cash market keeps server-wide order while cold quotes hydrate and freshness filters remain active',()=>{
+ const elements=Object.fromEntries(['items-tbody','item-count','items-more','item-min-price','item-max-price','item-review-filter'].map(id=>[id,{innerHTML:'',textContent:'',value:''}]));
+ const quotes={Beta:{price:10,fresh:true}},rows=[{name:'Cheap beyond 500',latestPrice:.5},{name:'Beta',latestPrice:10}];
+ const globals={_filtered:rows.slice(),_sortKey:'latestPrice',_sortDir:1,_itemsMode:'market',_marketItemsTotal:510,_savedReadGeneration:0,_marketDetails:{},
+  document:{getElementById:id=>elements[id]},canonicalQuote:name=>quotes[name],canonicalPrice:name=>quotes[name]?.fresh?quotes[name].price:null,
+  currentDecisionRow:()=>null,currentDecisionData:()=>null,refreshItemSortHeaders(){},releaseItemHistoryViews(){},
+  stableDomId:(_,name)=>name,marketItemThumbHtml:()=>'',marketItemType:()=>'',esc:v=>String(v??''),
+  canonicalBindingHtml:(name,field)=>field==='unit'?(quotes[name]?.fresh?'$'+quotes[name].price:'Unavailable'):'',
+  updateBlacklistCount(){},refreshCanonicalBindings(){},installResearchControlSemantics(){}};
+ const render=()=>run(['finiteNum','canonicalTableSort','canonicalSortValue','canonicalCashFiltersPass','canonicalItemCells','sortAndRenderCashMarketItems'],'sortAndRenderCashMarketItems()',globals);
+ const names=()=>[...elements['items-tbody'].innerHTML.matchAll(/class="item-title-main">([^<]+)/g)].map(m=>m[1]);
+ render();assert.deepEqual(names(),['Cheap beyond 500','Beta']);assert.match(elements['items-tbody'].innerHTML,/Unavailable/);
+ quotes['Cheap beyond 500']={price:.5,fresh:true};render();assert.deepEqual(names(),['Cheap beyond 500','Beta']);assert.match(elements['items-tbody'].innerHTML,/\$0.5/);
+ elements['item-max-price'].value='1';render();assert.deepEqual(names(),['Cheap beyond 500']);
+ quotes['Cheap beyond 500'].fresh=false;render();assert.deepEqual(names(),[]);
+ quotes['Cheap beyond 500'].fresh=true;render();assert.deepEqual(names(),['Cheap beyond 500']);
+});
+
+test('cash revision refreshes the globally ranked page once and restores details only for its owner',async()=>{
+ for(const change of ['none','basis','generation','revision','query']){
+  const timers=[],calls=[],reopened=[],row={id:'synthetic-detail',style:{display:'block'}};let finish;
+  const globals={currentViewTimer:null,currentRenderedKey:'',currentRenderedRevision:'1',_savedReadGeneration:4,_itemsBasis:'cash',_itemsMode:'market',_marketItems:[{name:'Cheap'}],_marketItemsKey:'query',
+   active:{id:'SYNTHETIC'},canonicalCashState:{revision:'2'},portfolioCashState:{value:{},acceptedRevision:'2',lastValueReadAt:1},_bkView:'source',
+   setTimeout:callback=>{timers.push(callback);return timers.length;},
+   document:{querySelectorAll:()=>[row],getElementById:id=>id==='tab-items'?{classList:{contains:()=>true}}:row},
+   renderCurrentSources(){},requestCurrentAnalysis(){},renderCurrentAnalysis(){},renderCurrentBreakdown(){},renderCurrentMarket(){},canonicalPortfolioSummary:()=>({}),
+   marketItemsQueryKey:()=>globals.query||'query',_marketItemsCache:{clear(){calls.push('clear');}},
+   buildMarketItemsTab:force=>{calls.push(force);row.style.display='none';return new Promise(resolve=>{finish=resolve;});},
+   filterItems(){assert.fail('Market refresh must not use portfolio filters');},sortAndRenderMarketItems(){assert.fail('A new revision requires a server-wide rank, not a cached-page sort');},
+   toggleItemDetail:id=>reopened.push(id),refreshCurrentSourcePanels(){}};
+  const queue=()=>{run(['queueCurrentViewRender'],'queueCurrentViewRender()',globals);timers.shift()();};
+  queue();assert.deepEqual(calls,['clear',true]);queue();assert.deepEqual(calls,['clear',true]);
+  if(change==='basis')globals._itemsBasis='research';
+  if(change==='generation')globals._savedReadGeneration++;
+  if(change==='revision')globals.canonicalCashState.revision='3';
+  if(change==='query')globals.query='new-query';
+  finish();await new Promise(resolve=>setImmediate(resolve));
+  assert.deepEqual(reopened,change==='none'?['synthetic-detail']:[]);
+ }
+});
+
+test('native v2 one/two-holding exports reach actual paste preview without weakening generic import thresholds',()=>{
+ const elements=new Map();
+ const el=id=>{if(!elements.has(id))elements.set(id,{value:'',style:{},innerHTML:'',textContent:''});return elements.get(id);};
+ const globals={IDX,_parsedData:null,document:{getElementById:el},cleanText:v=>String(v??'').trim(),categorize:()=>['Synthetic','Synthetic'],
+  fmt:v=>v===null?'Unavailable':'$'+v,fmtD:v=>v===null?'Unavailable':String(v),fmtP:v=>Number.isFinite(v)?String(v):'Unavailable',clr:()=>'',fixture:null};
+ const funcs=['finiteNum','snapshotExportText','parseTextFormat','parseCSVRows','parseCSVFormat','importNumber','importWeightedAvg','importExactKey','normalizeImportRows','buildSnapshotData','isNativeHoldingsExport','processText','onPasteInput'];
+ for(const count of [1,2]){
+  globals.fixture={data:{items:Array.from({length:count},(_,i)=>['Synthetic '+i,i+1,null,null,null,null,'Synthetic','Synthetic'])}};
+  const text=run(funcs,'snapshotExportText(fixture)',globals);el('paste-input').value=text;run(funcs,'onPasteInput()',globals);
+  assert.equal(el('parse-result').style.display,'block');assert.equal(globals._parsedData.items.length,count);
+  assert.deepEqual(Array.from(globals._parsedData.items,row=>[row[IDX.n],row[IDX.q]]).sort((a,b)=>a[0].localeCompare(b[0])),globals.fixture.data.items.map(row=>[row[IDX.n],row[IDX.q]]).sort((a,b)=>a[0].localeCompare(b[0])));
+  for(const row of globals._parsedData.items)for(const index of [IDX.pct,IDX.d,IDX.ct,IDX.pt])assert.equal(row[index],null);
+  assert.match(el('parse-preview').innerHTML,/Unavailable/);
+  el('paste-input').value=text.replace('CS2Dash holdings export v2','Generic pasted holdings');run(funcs,'onPasteInput()',globals);
+  assert.equal(el('parse-result').style.display,'none');assert.equal(globals._parsedData,null);
+ }
+ const short='CS2Dash holdings export v2\nA\nA\n1\nN/A\nN/A\nN/A\nN/A';assert.ok(short.length<100);
+ el('paste-input').value=short;run(funcs,'onPasteInput()',globals);assert.equal(globals._parsedData.items[0][IDX.n],'A');
+ for(const invalid of [short.replace('export v2','export v20'),short.replace('\n1\n','\n0\n'),'CS2Dash holdings export v2\nmalformed']){
+  el('paste-input').value=invalid;run(funcs,'onPasteInput()',globals);assert.equal(el('parse-result').style.display,'none');assert.equal(globals._parsedData,null);
+ }
+ globals.smallCSV='Item Name,Amount\nAlpha,1\nBeta,2';run(funcs,"processText(smallCSV,'synthetic.csv')",globals);
+ assert.equal(globals._parsedData,null);assert.equal(el('parse-result').style.display,'none');
+});
+
 test('complete inline script renders research Overview, Items and both group scopes with synthetic DOM/data',async()=>{
  const elements=new Map(),chartKinds=[];
  function element(id=''){

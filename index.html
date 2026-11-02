@@ -343,6 +343,8 @@ tr:hover td{background:rgba(255,255,255,.025)}
 @media(max-width:900px){
   .resp-grid-movers{grid-template-columns:1fr}
   .allocation-combo-grid{grid-template-columns:1fr}
+  .header-right{width:100%;max-width:100%;min-width:0;flex-wrap:wrap}
+  .resp-tabs{min-width:0;max-width:100%;flex-wrap:wrap;overflow-x:visible}
 }
 
 /* -- MOBILE (max 600px) -- */
@@ -701,11 +703,11 @@ tr:hover td{background:rgba(255,255,255,.025)}
         <div class="data-menu-actions">
           <button class="sort-btn active readonly-mutation" id="market-sync-btn" onclick="startDataTask('full_pull')">Pull Market Data</button>
           <button class="sort-btn" onclick="pollMarketStatus(true); buildMarketAnalysis()">Refresh Status</button>
-          <span id="market-sync-status" style="font-size:11px;color:var(--dim)">Checks the configured cash feeds within their pacing/backoff. Current views update after quote commits; Steam asks stay on demand.</span>
+          <span id="market-sync-status" style="font-size:11px;color:var(--dim)">Background provider and history work follows the selected strategy and saved pacing.</span>
         </div>
         <div class="data-ops-panel readonly-mutation">
           <div class="data-ops-grid">
-            <div class="data-ops-field" hidden>
+            <div class="data-ops-field">
               <label>Pull strategy</label>
               <select class="search-select" id="data-task-mode">
                 <option value="accumulate_missing" selected>Fill missing data</option>
@@ -714,27 +716,27 @@ tr:hover td{background:rgba(255,255,255,.025)}
                 <option value="full_pull">Full pull + priority charts</option>
               </select>
             </div>
-            <div class="data-ops-field" hidden>
+            <div class="data-ops-field">
               <label>Speed</label>
               <select class="search-select" id="data-pull-mode">
                 <option value="gentle" selected>Gentle background</option>
                 <option value="release">Release catch-up</option>
               </select>
             </div>
-            <div class="data-ops-field" hidden>
+            <div class="data-ops-field">
               <label>Steam charts per cycle</label>
               <input class="search-select" id="data-history-limit" type="number" min="0" max="500" step="10" value="40">
             </div>
-            <div class="data-ops-field" hidden>
+            <div class="data-ops-field">
               <label>Cycles</label>
               <input class="search-select" id="data-task-cycles" type="number" min="1" max="12" step="1" value="2">
             </div>
-            <div class="data-ops-field" hidden>
+            <div class="data-ops-field">
               <label>Options</label>
               <label style="display:flex;align-items:center;gap:6px;text-transform:none;letter-spacing:0;margin:0;color:var(--text)"><input type="checkbox" id="data-retry-failures" checked> Retry Steam cooldowns</label>
             </div>
             <div class="data-ops-field">
-              <button class="sort-btn active" id="data-task-start-btn" onclick="startDataTask()">Refresh cash prices</button>
+              <button class="sort-btn active" id="data-task-start-btn" onclick="startDataTask()">Start Background Fill</button>
             </div>
           </div>
           <div class="data-task-strip" id="data-task-strip" style="display:none">
@@ -6158,9 +6160,12 @@ function buildSnapshotData(rawItems){
 }
 
 // -- PROCESS TEXT (paste input handler) -----------------------------
+function isNativeHoldingsExport(text){
+  return /^\uFEFF?CS2Dash holdings export v2(?:\r?\n|$)/.test(String(text || ''));
+}
 function onPasteInput(){
   const text=document.getElementById('paste-input').value;
-  if(text.length<100){
+  if(text.length<100 && !isNativeHoldingsExport(text)){
     document.getElementById('parse-result').style.display='none';
     document.getElementById('parse-error').style.display='none';
     _parsedData=null;
@@ -6176,17 +6181,19 @@ function processText(text,filename){
 
   let rawItems=null;
   let formatUsed='';
+  const nativeExport=isNativeHoldingsExport(text);
+  const minimumTextItems=nativeExport?1:10;
 
   // Try text format first (website copy-paste)
   const textItems=parseTextFormat(text);
-  if(textItems.length>=10){ rawItems=textItems; formatUsed='Website text format'; }
+  if(textItems.length>=minimumTextItems){ rawItems=textItems; formatUsed=nativeExport?'CS2Dash holdings export v2':'Website text format'; }
   else {
     // Try CSV format
     const csvItems=parseCSVFormat(text);
     if(csvItems&&csvItems.length>=10){ rawItems=csvItems; formatUsed='CSV format'; }
   }
 
-  if(!rawItems||rawItems.length<10){
+  if(!rawItems||rawItems.length<minimumTextItems){
     document.getElementById('parse-error').style.display='block';
     document.getElementById('parse-error').textContent=`Could not parse data. Found ${textItems.length} items in text format. Make sure you copied the full Items overview section including all items, or use a valid CSV file.`;
     return;
@@ -6194,6 +6201,7 @@ function processText(text,filename){
 
   try{
     _parsedData=buildSnapshotData(rawItems);
+    if(nativeExport && !_parsedData.items.length) throw new Error('No valid holdings found in this native export.');
     const T=_parsedData.totals;
     const stats=_parsedData.importStats||{};
     const duplicateMsg=(stats.exactDuplicates||stats.mergedRows)
@@ -6212,6 +6220,7 @@ function processText(text,filename){
     `;
     document.getElementById('parse-result').style.display='block';
   }catch(e){
+    _parsedData=null;
     document.getElementById('parse-error').style.display='block';
     document.getElementById('parse-error').textContent='Parse error: '+e.message;
   }
@@ -7956,11 +7965,8 @@ function sortAndRenderResearchItems() {
 }
 function sortAndRenderCashMarketItems(){
   refreshItemSortHeaders();
-  canonicalTableSort(_filtered,function(item,key){
-    if (key === 'rarity') return String(item.rarity || '');
-    if (key === 'type') return marketItemType(item);
-    return canonicalSortValue(item.marketHashName || item.name,key);
-  });
+  // The server ranks the entire matching catalog before pagination. Quote
+  // hydration updates cells, never the order of this already-ranked page.
   var tbody = document.getElementById('items-tbody'); if (!tbody) return;
   releaseItemHistoryViews(); _marketDetails = Object.create(null);
   var rows = _filtered.filter(function(item){ return canonicalCashFiltersPass(item.marketHashName || item.name); }).slice(0,500);
@@ -7973,7 +7979,7 @@ function sortAndRenderCashMarketItems(){
       +'<tr id="'+rowId+'" class="item-detail-row" style="display:none"></tr>';
   }).join('');
   document.getElementById('item-count').textContent = rows.length+' shown / '+_marketItemsTotal+' metadata matches · cash prices from canonical saved quotes';
-  var more = document.getElementById('items-more'); if (more) more.textContent = 'Cash price sorting and price filters apply to the loaded '+_filtered.length+' exact items. Narrow the metadata search for more matches.';
+  var more = document.getElementById('items-more'); if (more) more.textContent = 'Sorting and price filters apply across all matching market items. This page contains '+_filtered.length+' exact items.';
   updateBlacklistCount(); refreshCanonicalBindings();
 
   installResearchControlSemantics();
@@ -8221,9 +8227,17 @@ function queueCurrentViewRender(){
       if(changed){
         var open=Array.from(document.querySelectorAll('.item-detail-row')).filter(function(r){return r.style.display!=='none';}).map(function(r){return r.id;});
         if(_itemsBasis!=='cash')return;
-        if(_itemsMode==='portfolio')filterItems();
-        else if(_marketItems.length){_marketItemsCache.clear();sortAndRenderMarketItems();}
-        open.forEach(function(id){var row=document.getElementById(id);if(row && row.style.display==='none')toggleItemDetail(id);});
+        if(_itemsMode==='portfolio'){
+          filterItems();
+          open.forEach(function(id){var row=document.getElementById(id);if(row && row.style.display==='none')toggleItemDetail(id);});
+        }else if(_marketItems.length){
+          var generation=_savedReadGeneration,revision=canonicalCashState.revision,queryKey=marketItemsQueryKey();
+          _marketItemsCache.clear();
+          Promise.resolve(buildMarketItemsTab(true)).then(function(){
+            if(_itemsBasis!=='cash'||_itemsMode!=='market'||generation!==_savedReadGeneration||revision!==canonicalCashState.revision||queryKey!==marketItemsQueryKey()||_marketItemsKey!==queryKey)return;
+            open.forEach(function(id){var row=document.getElementById(id);if(row && row.style.display==='none')toggleItemDetail(id);});
+          });
+        }
       }
     }
     refreshCurrentSourcePanels();
