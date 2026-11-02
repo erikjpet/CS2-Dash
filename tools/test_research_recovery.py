@@ -116,6 +116,10 @@ class RecoveryTests(unittest.TestCase):
         plan = recovery.plan_recovery(self.source, self.derived, self.archive)
         self.assertEqual(plan['expectedRows'], dict.fromkeys(recovery.TABLES, 1))
         self.assertEqual(plan['asOf']['quotesObservedAt'], [100, 100])
+        self.assertIsNone(plan['personalTablesModified'])
+        self.assertFalse(plan['personalPreservationVerified'])
+        self.assertTrue(plan['sources']['derived']['closedSourceValidated'])
+        self.assertEqual(len(plan['sources']['derived']['snapshotSha256']), 64)
         self.assertNotIn('Synthetic item', json.dumps(plan))
         self.assertEqual(before, recovery.digest(self.source))
 
@@ -135,6 +139,10 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(receipt['rawSteamChartRowsImported'], 0)
         self.assertEqual(receipt['importedRows'], dict.fromkeys(recovery.TABLES, 1))
         self.assertTrue(receipt['ftsRebuilt'])
+        self.assertFalse(receipt['personalTablesModified'])
+        self.assertTrue(receipt['personalPreservationVerified'])
+        self.assertEqual(receipt['protectedTablesVerified'], 3)
+        self.assertEqual(len(receipt['protectedStateSha256']), 64)
         with connection(self.target) as c:
             self.assertEqual(c.execute('SELECT * FROM settings').fetchall(), [('private-setting', 'synthetic-sentinel')])
             self.assertEqual(c.execute('SELECT * FROM portfolio_items').fetchall(), [('Synthetic holding', 2)])
@@ -222,6 +230,124 @@ class RecoveryTests(unittest.TestCase):
         with connection(self.target) as c:
             self.assertEqual(c.execute('SELECT COUNT(*) FROM market_item_prices').fetchone()[0], 0)
             self.assertEqual(c.execute('SELECT value FROM settings').fetchone()[0], 'synthetic-sentinel')
+
+    def assert_trigger_refused(self, table):
+        # The trigger exists BEFORE clone: the legitimate marker includes it.
+        # This exercises trigger safety, not the separate changed-clone fence.
+        with connection(self.source) as c:
+            if table == recovery.RECEIPTS:
+                c.execute('CREATE TABLE ' + table + '(source_fingerprint TEXT PRIMARY KEY,applied_at INTEGER,receipt_json TEXT)')
+            c.execute('CREATE TRIGGER synthetic_side_effect AFTER INSERT ON ' + table +
+                      " BEGIN UPDATE settings SET value='unexpected-trigger-write'; END")
+        original_hash = recovery.digest(self.source)
+        self.clone()
+        target_hash = recovery.digest(self.target)
+        with self.assertRaisesRegex(recovery.RecoveryError, 'Unsupported recovery target trigger'):
+            recovery.apply_recovery(self.target, self.derived, self.archive)
+        self.assertEqual(original_hash, recovery.digest(self.source))
+        self.assertEqual(target_hash, recovery.digest(self.target))
+        with connection(self.target) as c:
+            self.assertEqual(c.execute('SELECT value FROM settings').fetchone()[0], 'synthetic-sentinel')
+            self.assertTrue(all(c.execute('SELECT COUNT(*) FROM ' + name).fetchone()[0] == 0 for name in recovery.TABLES))
+            self.assertIsNone(recovery.recovery_status(c))
+
+    def test_inherited_research_trigger_cannot_modify_protected_settings(self):
+        self.assert_trigger_refused('market_item_prices')
+
+    def test_inherited_receipt_trigger_cannot_modify_protected_settings(self):
+        self.assert_trigger_refused(recovery.RECEIPTS)
+
+    def test_committed_derived_wal_is_refused_without_touching_any_input(self):
+        self.clone()
+        writer = sqlite3.connect(self.derived)
+        try:
+            writer.execute('PRAGMA journal_mode=WAL')
+            writer.execute('PRAGMA wal_autocheckpoint=0')
+            original_main = recovery.digest(self.derived)
+            writer.execute('UPDATE item_market_metrics SET trend_pct=99')
+            writer.commit()
+            self.assertEqual(recovery.digest(self.derived), original_main)
+            paths = [self.derived, Path(str(self.derived) + '-wal'), Path(str(self.derived) + '-shm')]
+            self.assertGreater(paths[1].stat().st_size, 0)
+            before = {path: recovery.digest(path) for path in paths}
+            target_hash = recovery.digest(self.target)
+            for operation in (recovery.plan_recovery, recovery.apply_recovery):
+                with self.subTest(operation=operation.__name__):
+                    with self.assertRaisesRegex(recovery.RecoveryError, 'not closed'):
+                        operation(self.target, self.derived, self.archive)
+                    self.assertEqual(before, {path: recovery.digest(path) for path in paths})
+                    self.assertEqual(target_hash, recovery.digest(self.target))
+        finally:
+            writer.close()
+
+    def test_closed_wal_mode_derived_source_uses_consolidated_snapshot(self):
+        with connection(self.derived) as c:
+            self.assertEqual(c.execute('PRAGMA journal_mode=WAL').fetchone()[0], 'wal')
+            c.execute('UPDATE item_market_metrics SET trend_pct=99')
+        self.assertFalse(Path(str(self.derived) + '-wal').exists())
+        self.assertFalse(Path(str(self.derived) + '-shm').exists())
+        before = recovery.digest(self.derived)
+        self.clone()
+        receipt = recovery.apply_recovery(self.target, self.derived, self.archive)
+        self.assertEqual(receipt['status'], 'applied')
+        self.assertEqual(receipt['sources']['derived']['sha256'], before)
+        self.assertEqual(recovery.digest(self.derived), before)
+        self.assertFalse(Path(str(self.derived) + '-wal').exists())
+        self.assertFalse(Path(str(self.derived) + '-shm').exists())
+        with connection(self.target) as c:
+            self.assertEqual(c.execute('SELECT trend_pct FROM item_market_metrics').fetchone()[0], 99)
+
+    def test_derived_queries_use_the_recorded_snapshot_after_original_changes(self):
+        original_hash = recovery.digest(self.derived)
+        with recovery.open_sources(self.derived, self.archive) as (source, hot, cold, manifest):
+            before = source.execute('SELECT trend_pct FROM item_market_metrics').fetchone()[0]
+            with closing(recovery.read_db(self.source)) as target:
+                first_plan = recovery.source_plan(target, source, hot, cold, manifest)
+            snapshot_path = Path(source.execute('PRAGMA database_list').fetchone()[2])
+            self.assertEqual(manifest['derived']['sha256'], original_hash)
+            self.assertEqual(manifest['derived']['snapshotSha256'], recovery.digest(snapshot_path))
+            with connection(self.derived) as original:
+                original.execute('UPDATE item_market_metrics SET trend_pct=99')
+            self.assertNotEqual(recovery.digest(self.derived), original_hash)
+            self.assertEqual(source.execute('SELECT trend_pct FROM item_market_metrics').fetchone()[0], before)
+            self.assertEqual(manifest['derived']['snapshotSha256'], recovery.digest(snapshot_path))
+        next_plan = recovery.plan_recovery(self.source, self.derived, self.archive)
+        self.assertNotEqual(first_plan['sourceFingerprint'], next_plan['sourceFingerprint'])
+
+    def test_transaction_write_allowlist_blocks_unexpected_settings_write(self):
+        self.clone()
+        original_insert = recovery.insert_rows
+
+        def side_effect(conn, table, fields, rows):
+            conn.execute("UPDATE settings SET value='unexpected-write'")
+            return original_insert(conn, table, fields, rows)
+
+        with patch.object(recovery, 'insert_rows', side_effect=side_effect):
+            with self.assertRaisesRegex(recovery.RecoveryError, 'Unexpected recovery write blocked: settings'):
+                recovery.apply_recovery(self.target, self.derived, self.archive)
+        with connection(self.target) as c:
+            self.assertEqual(c.execute('SELECT value FROM settings').fetchone()[0], 'synthetic-sentinel')
+            self.assertTrue(all(c.execute('SELECT COUNT(*) FROM ' + name).fetchone()[0] == 0 for name in recovery.TABLES))
+            self.assertIsNone(recovery.recovery_status(c))
+
+    def test_protected_state_proof_rolls_back_unexpected_mutation(self):
+        self.clone()
+        original_insert = recovery.insert_rows
+
+        def side_effect(conn, table, fields, rows):
+            # Independently prove the final digest fence, even if write
+            # admission is accidentally disabled by future helper code.
+            conn.set_authorizer(None)
+            conn.execute("UPDATE settings SET value='unexpected-write'")
+            return original_insert(conn, table, fields, rows)
+
+        with patch.object(recovery, 'insert_rows', side_effect=side_effect):
+            with self.assertRaisesRegex(recovery.RecoveryError, 'Protected tables or schema changed'):
+                recovery.apply_recovery(self.target, self.derived, self.archive)
+        with connection(self.target) as c:
+            self.assertEqual(c.execute('SELECT value FROM settings').fetchone()[0], 'synthetic-sentinel')
+            self.assertTrue(all(c.execute('SELECT COUNT(*) FROM ' + name).fetchone()[0] == 0 for name in recovery.TABLES))
+            self.assertIsNone(recovery.recovery_status(c))
 
 
 if __name__ == '__main__':

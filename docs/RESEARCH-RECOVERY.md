@@ -27,11 +27,27 @@ and SHA-256 identity marker. `apply` requires that marker and an unchanged targe
 refuses a WAL or preexisting research rows, and imports in one transaction. A
 repeated import with the same receipt and counts is idempotent.
 
+The personal-state source passed to `clone` can be a live WAL database: its online
+backup includes committed WAL state without checkpointing or changing that source.
+This differs from the `--derived` recovery input, which must be a closed,
+consolidated database with **no `-wal`, `-shm` or `-journal` sidecar**. The helper
+refuses those sidecars rather than hashing only the main file and silently reading
+different committed data from its WAL. Prepare a separate consistent backup if
+the retained derived source is still open; keep the original and its sidecars intact.
+
 The supported archive contains `compact-price-store-candidate/current-hot.sqlite`
 and `compact-price-store-candidate/cold-evidence.sqlite`. The derived database must
 contain the original `item_market_metrics`, `lookup_common` and `lookup_windows`
 schemas. Source file/member hashes and schema/reference checks prevent accidental
 mixing of unrelated sources.
+
+Derived queries run against a private SQLite backup snapshot, made through an
+immutable read-only input connection. The helper verifies the original file's
+identity before and after the snapshot and consolidates only the new snapshot.
+The receipt binds both the original main-file SHA-256 and the SHA-256 of the
+snapshot actually queried. Later changes to the original cannot change an
+in-progress recovery's input. Archive identity is also rechecked after members
+are read. Neither input is opened for writes or checkpointed.
 
 Only these empty compatibility tables are populated:
 
@@ -45,11 +61,26 @@ Only these empty compatibility tables are populated:
 No `price_history` rows are synthesized. No price observations are invented.
 Existing personal, settings, catalog and raw-history tables remain untouched.
 
+Recovery targets must be ordinary v1 tables. SQL triggers attached to any recovery
+write object, including the receipt table, are unsupported and cause refusal
+before import. Standard v1 external-content FTS remains supported through its
+explicit rebuild; it does not require SQL triggers. The transaction also permits
+writes only to the four research tables, its receipt and verified FTS5 shadow
+tables. A protected table/schema digest is compared after all writes and before
+commit; any unexpected change rolls back the complete import.
+
 ## Runtime provenance
 
 `research_recovery.recovery_status(connection)` reads the most recent
 `research_recovery_receipts` receipt. It contains source hashes, imported table
 counts, lookup-window counts and original date ranges, not asset rows or prices.
+An unapplied plan leaves `personalTablesModified` unknown and
+`personalPreservationVerified` false. Only a committed transaction with matching
+protected-state proofs records `personalTablesModified: false` and
+`personalPreservationVerified: true`, together with the verified table count and
+aggregate state digest. A receipt alone is insufficient for an idempotent return:
+the unchanged clone marker must also identify that completed recovery, with
+matching expected and existing row counts.
 
 Show archived research as dated/stale evidence until an authorized refresh
 replaces it. `appliedAt` is the recovery operation time, **not** the source's
@@ -64,5 +95,8 @@ Current cash prices retain their independent canonical quote/freshness rules.
 
 Run `python tools/test_research_recovery.py -v`. The synthetic suite verifies clone
 identity, WAL-source preservation, atomic rollback, idempotence, FTS, provenance,
-existing-data refusal and preservation of personal state. It uses no live service,
-real holdings, credentials, external provider or network request.
+existing-data refusal and preservation of personal state. Negative fixtures create
+a settings-mutating trigger before cloning, exercise receipt triggers and both
+transaction preservation fences, and keep a derived WAL writer open while its
+main-file hash remains unchanged. The suite uses no live service, real holdings,
+credentials, external provider or network request.

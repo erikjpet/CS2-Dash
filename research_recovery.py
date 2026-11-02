@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import tempfile
 import time
 import zipfile
 import zlib
@@ -27,6 +28,8 @@ MAX_MEMBER_BYTES = 512 * 1024 * 1024
 MAX_PAYLOAD_BYTES = 16 * 1024 * 1024
 MARKER_SUFFIX = '.research-clone.json'
 VERSION = 1
+FTS = 'market_item_lookup_fts'
+FTS_SHADOWS = frozenset(FTS + suffix for suffix in ('_data', '_idx', '_content', '_docsize', '_config'))
 
 PRICE_COLUMNS = ('name', 'provider', 'price', 'median', 'solid_price', 'lowest_sell_order',
                  'highest_buy_order', 'spread_pct', 'stability_pct', 'confidence_pct',
@@ -58,11 +61,68 @@ def digest(path):
     return hasher.hexdigest()
 
 
-def read_db(path):
-    conn = sqlite3.connect(Path(path).resolve().as_uri() + '?mode=ro', uri=True, timeout=5)
+def read_db(path, *, immutable=False):
+    suffix = '?mode=ro&immutable=1' if immutable else '?mode=ro'
+    conn = sqlite3.connect(Path(path).resolve().as_uri() + suffix, uri=True, timeout=5)
     conn.row_factory = sqlite3.Row
     conn.execute('PRAGMA query_only=ON')
     return conn
+
+
+def file_identity(path):
+    """Fence a byte hash against a normal concurrent file replacement/write."""
+    path = Path(path)
+    before = path.stat()
+    value = digest(path)
+    after = path.stat()
+    fields = ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns')
+    identity = tuple(getattr(before, field) for field in fields)
+    if identity != tuple(getattr(after, field) for field in fields):
+        raise RecoveryError('Recovery source changed while its identity was read')
+    return identity, value
+
+
+def closed_source_identity(path):
+    """Derived inputs must be consolidated; never inspect or checkpoint a WAL."""
+    path = Path(path)
+    for suffix in ('-wal', '-shm', '-journal'):
+        if Path(str(path) + suffix).exists():
+            raise RecoveryError('Derived source is not closed: WAL/journal sidecar present')
+    if not path.is_file() or not 0 < path.stat().st_size <= MAX_MEMBER_BYTES:
+        raise RecoveryError('Derived source size outside recovery bound')
+    value = file_identity(path)
+    for suffix in ('-wal', '-shm', '-journal'):
+        if Path(str(path) + suffix).exists():
+            raise RecoveryError('Derived source opened while its identity was read')
+    return value
+
+
+def snapshot_derived(source, destination):
+    """Bind every query to one closed backup, with no writes to the input."""
+    before = closed_source_identity(source)
+    original = read_db(source, immutable=True)
+    snapshot = sqlite3.connect(destination)
+    deadline = time.monotonic() + 120
+
+    def progress(status, remaining, total):
+        if time.monotonic() > deadline:
+            raise RecoveryError('Derived snapshot deadline exceeded')
+
+    try:
+        original.backup(snapshot, pages=1024, progress=progress, sleep=.05)
+        # Consolidation belongs only to the new snapshot, never to the input.
+        if snapshot.execute('PRAGMA journal_mode=DELETE').fetchone()[0].lower() != 'delete':
+            raise RecoveryError('Derived snapshot could not be consolidated')
+        if snapshot.execute('PRAGMA quick_check').fetchone()[0] != 'ok':
+            raise RecoveryError('Derived snapshot integrity check failed')
+    finally:
+        original.close()
+        snapshot.close()
+    if closed_source_identity(source) != before:
+        raise RecoveryError('Derived source changed while its snapshot was made')
+    return {'file': Path(source).name, 'sha256': before[1],
+            'snapshotSha256': digest(destination), 'closedSourceValidated': True,
+            'snapshotMethod': 'immutable_readonly_sqlite_backup'}
 
 
 def quote_identifier(name):
@@ -80,6 +140,59 @@ def require_columns(conn, table, expected):
 
 def count(conn, table):
     return conn.execute('SELECT COUNT(*) FROM ' + quote_identifier(table)).fetchone()[0]
+
+
+def recovery_write_tables(conn):
+    """Only the v1 tables and its real FTS5 shadows are writable."""
+    kinds = {row['name']: row['type'] for row in conn.execute('PRAGMA table_list') if row['schema'] == 'main'}
+    for table in TABLES:
+        if kinds.get(table) != 'table':
+            raise RecoveryError('Recovery target must be an ordinary table: ' + table)
+    if RECEIPTS in kinds:
+        if kinds[RECEIPTS] != 'table':
+            raise RecoveryError('Recovery receipt must be an ordinary table')
+        require_columns(conn, RECEIPTS, ('source_fingerprint', 'applied_at', 'receipt_json'))
+    allowed = set(TABLES) | {RECEIPTS}
+    fts = conn.execute("SELECT sql FROM sqlite_master WHERE name=?", (FTS,)).fetchone()
+    if fts:
+        sql = ''.join((fts[0] or '').lower().split())
+        if not sql.startswith('createvirtualtable') or 'usingfts5(' not in sql or "content='market_item_lookup'" not in sql:
+            raise RecoveryError('Unexpected lookup FTS contract')
+        if kinds.get(FTS) != 'virtual':
+            raise RecoveryError('Unexpected lookup FTS contract')
+        allowed.add(FTS)
+        allowed.update(name for name in FTS_SHADOWS if kinds.get(name) == 'shadow')
+    # V1 maintains external-content FTS with the explicit rebuild below. It has
+    # no SQL trigger on these write objects; custom trigger effects are unknown.
+    for trigger in conn.execute("SELECT name,tbl_name FROM sqlite_master WHERE type='trigger'"):
+        if trigger['tbl_name'] in allowed:
+            raise RecoveryError('Unsupported recovery target trigger: ' + trigger['name'])
+    return allowed
+
+
+def protected_state(conn, allowed):
+    """Content/schema proof only; never return any protected row values."""
+    def row_digest(row):
+        typed = []
+        for value in row:
+            if isinstance(value, bytes):
+                typed.append(('blob', value.hex()))
+            elif isinstance(value, float):
+                typed.append(('real', value.hex()))
+            else:
+                typed.append((type(value).__name__, value))
+        return hashlib.sha256(json.dumps(typed, ensure_ascii=True, separators=(',', ':')).encode()).digest()
+
+    tables = {}
+    for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"):
+        name = row['name']
+        if name not in allowed:
+            rows = sorted(row_digest(value) for value in conn.execute('SELECT * FROM ' + quote_identifier(name)))
+            tables[name] = (len(rows), hashlib.sha256(b''.join(rows)).hexdigest())
+    schema = [tuple(row) for row in conn.execute('SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name')]
+    value = {'tables': tables, 'schema': schema}
+    return {'tableCount': len(tables), 'sha256': hashlib.sha256(
+        json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(',', ':')).encode()).hexdigest()}
 
 
 def marker_path(target):
@@ -146,12 +259,16 @@ def validate_clone(target):
 def open_sources(derived, archive):
     derived, archive = Path(derived).resolve(), Path(archive).resolve()
     opened = []
+    temporary = tempfile.TemporaryDirectory(prefix='cs2-research-input-')
     try:
-        source = read_db(derived)
+        snapshot = Path(temporary.name) / 'derived.sqlite'
+        derived_manifest = snapshot_derived(derived, snapshot)
+        source = read_db(snapshot)
         opened.append(source)
         members = {}
-        manifest = {'derived': {'file': derived.name, 'sha256': digest(derived)},
-                    'archive': {'file': archive.name, 'sha256': digest(archive)}, 'members': {}}
+        archive_identity = file_identity(archive)
+        manifest = {'derived': derived_manifest,
+                    'archive': {'file': archive.name, 'sha256': archive_identity[1]}, 'members': {}}
         with zipfile.ZipFile(archive) as compressed:
             for label, member in [('hot', HOT_MEMBER), ('cold', COLD_MEMBER)]:
                 info = compressed.getinfo(member)
@@ -168,15 +285,19 @@ def open_sources(derived, archive):
                 conn.row_factory = sqlite3.Row
                 conn.execute('PRAGMA query_only=ON')
                 members[label] = conn
+        if file_identity(archive) != archive_identity:
+            raise RecoveryError('Recovery archive changed while its members were read')
         yield source, members['hot'], members['cold'], manifest
     except (KeyError, sqlite3.Error, zipfile.BadZipFile) as exc:
         raise RecoveryError('Recovery source cannot be read with the expected schema') from exc
     finally:
         for conn in opened:
             conn.close()
+        temporary.cleanup()
 
 
 def source_plan(target_conn, derived, hot, cold, manifest):
+    recovery_write_tables(target_conn)
     for table, fields in EXPECTED.items():
         require_columns(target_conn, table, fields)
     require_columns(derived, 'item_market_metrics', METRIC_COLUMNS)
@@ -219,7 +340,8 @@ def source_plan(target_conn, derived, hot, cold, manifest):
     return {'version': VERSION, 'sourceFingerprint': fingerprint, 'sources': manifest,
             'expectedRows': expected, 'existingRows': existing, 'asOf': asof,
             'windows': windows, 'rawSteamChartRowsImported': 0,
-            'personalTablesModified': False, 'canonicalLedgerModified': False,
+            'personalTablesModified': None, 'personalPreservationVerified': False,
+            'canonicalLedgerModified': False,
             'emptyTargetRequired': True, 'blockedByExistingRows': any(existing.values())}
 
 
@@ -262,7 +384,10 @@ def apply_recovery(target, derived, archive):
             previous = recovery_status(read)
         finally:
             read.close()
-        if previous and previous['sourceFingerprint'] == plan['sourceFingerprint'] and previous['importedRows'] == plan['existingRows']:
+        if (previous and marker.get('lastRecoveryFingerprint') == plan['sourceFingerprint']
+                and previous.get('personalPreservationVerified') is True
+                and previous['sourceFingerprint'] == plan['sourceFingerprint']
+                and previous['importedRows'] == plan['existingRows'] == plan['expectedRows']):
             return dict(previous, status='already_applied')
         if plan['blockedByExistingRows']:
             raise RecoveryError('Research target tables are not empty; no existing data overwritten')
@@ -270,11 +395,26 @@ def apply_recovery(target, derived, archive):
         validate_clone(target)
         conn = sqlite3.connect(target.as_uri() + '?mode=rw', uri=True, timeout=5)
         conn.row_factory = sqlite3.Row
+        denied = []
         try:
             conn.execute('BEGIN IMMEDIATE')
             if any(count(conn, table) for table in TABLES):
                 raise RecoveryError('Research target changed before transaction')
             conn.execute('CREATE TABLE IF NOT EXISTS ' + RECEIPTS + '(source_fingerprint TEXT PRIMARY KEY,applied_at INTEGER NOT NULL,receipt_json TEXT NOT NULL)')
+            allowed = recovery_write_tables(conn)
+            before = protected_state(conn, allowed)
+
+            def authorize(action, table, column, database, origin):
+                if action in (sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE):
+                    if database != 'main' or table not in allowed:
+                        denied.append(table)
+                        return sqlite3.SQLITE_DENY
+                elif action in (sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_DETACH):
+                    denied.append('database attachment')
+                    return sqlite3.SQLITE_DENY
+                return sqlite3.SQLITE_OK
+
+            conn.set_authorizer(authorize)
             @lru_cache(maxsize=2048)
             def raw_payload(identity):
                 if identity is None:
@@ -321,12 +461,18 @@ def apply_recovery(target, derived, archive):
                 raise RecoveryError('Recovered row-count proof failed')
             receipt = dict(plan, status='applied', appliedAt=int(time.time()), importedRows=imported,
                            ftsRebuilt=bool(fts), sourceEvidenceRetained=True,
+                           personalTablesModified=False, personalPreservationVerified=True,
+                           protectedTablesVerified=before['tableCount'], protectedStateSha256=before['sha256'],
                            meaning='Dated archived snapshots and aggregate metrics, not current canonical cash or raw Steam chart history')
             conn.execute('INSERT INTO ' + RECEIPTS + ' VALUES(?,?,?)',
                          (plan['sourceFingerprint'], receipt['appliedAt'], json.dumps(receipt, sort_keys=True)))
+            if protected_state(conn, allowed) != before:
+                raise RecoveryError('Protected tables or schema changed; recovery rolled back')
             conn.commit()
-        except BaseException:
+        except BaseException as exc:
             conn.rollback()
+            if denied and isinstance(exc, sqlite3.Error):
+                raise RecoveryError('Unexpected recovery write blocked: ' + str(denied[0])) from exc
             raise
         finally:
             conn.close()

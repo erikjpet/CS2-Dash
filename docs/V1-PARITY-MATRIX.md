@@ -1,23 +1,23 @@
 # CS2-04 — Version-one feature parity matrix
 
-Updated 2026-11-02. **Source restoration, portable checks and main publication passed. Browser acceptance and live verification remain pending. CS2-04 is not complete.**
+Updated 2026-11-02. **The focused cloud findings below are repaired and 97 portable application checks pass. Browser acceptance and live verification remain pending. CS2-04 is not complete.**
 
 This is the canonical delivery matrix for all **74** intake IDs. The original audited-live findings and line references are preserved in [the intake inventory](../tools/CS2-04-control-parity.md). “Audited live” below means that unchanged intake, not the isolated restoration. No initial missing/hidden finding is silently relabelled as a live repair.
 
 ## Baseline and stages
 
-There is no GitHub Release or tag for v1. The original v1.0 commit is `de8a469184d4802c536a8937c7d945f021a26314`; the later published v1 fixes through `0e98899ef060742fcec8acd1ce22d03a728f18dc` are included. See [verified baseline](V1-BASELINE.md). The audited live HTML SHA256 was `d927bb422cab87008429378f5938d9a3c9da634ab9a4b38c657ec7ca020dff5e`; isolated restored frontend SHA256 is `8addd31ea01059f68fa6fb1b96d7349776b57352c7798bf10045fa273f07c247`.
+There is no GitHub Release or tag for v1. The original v1.0 commit is `de8a469184d4802c536a8937c7d945f021a26314`; the later published v1 fixes through `0e98899ef060742fcec8acd1ce22d03a728f18dc` are included. See [verified baseline](V1-BASELINE.md). The audited live HTML SHA256 was `d927bb422cab87008429378f5938d9a3c9da634ab9a4b38c657ec7ca020dff5e`; isolated restored frontend SHA256 is `2c359d4c8b21a7b69a34da46158fc74776af2b2108b6aa6bdfa469c1ea738d4a`.
 
 | Stage | Verified state |
 | --- | --- |
 | Source | Research scope/widgets/routes restored alongside current cash functionality in isolated CS2 worktree. All 10 metric windows are materialized by explicit refresh. Warm/Sync use the continuing tracked job with selected-portfolio scope. |
-| Portable tests | **85** application checks: `tests` 17, `tools` 48 (36 runtime + 12 recovery), frontend Node 20. **9** additional site checks: runtime profile 5 and sync 4. Root syntax checks passed for 37 Python root files, root MJS files and the PowerShell launcher. |
+| Portable tests | **97** application checks: `tests` 17, `tools` 55 (36 runtime + 19 recovery), frontend Node 25. **9** unchanged site checks: runtime profile 5 and sync 4. Root syntax checks passed for 37 Python root files, root MJS files and the PowerShell launcher. |
 | Browser | **Pending for every row.** Prepared real-browser invented-data cases B1–B12; no restoration browser/listener run claimed. See [acceptance runner](../tools/V1-BROWSER-ACCEPTANCE.md). |
 | Published | **Confirmed to existing main branches:** CS2 implementation `e7894fe94e297aa442566724cf7acc318b29539d`; guarded site integration `b827906cd32d04c1c822e0eef581b47acd796cde`. Both remote identities were verified after consecutive publication. Later checkpoint-documentation commits do not alter this implementation. |
 | Live | **Pending for every row.** No source/data promotion or service restart performed for this restoration. |
 | Full v1 parity | **Open.** Source/test coverage is not proof that every click, real dataset and upstream prerequisite works in the deployed service. |
 
-Evidence keys: **F** = [20 frontend Node checks](../tools/frontend_restore.test.mjs), including synthetic DOM rendering (not a browser); **A** = [12 actual Handler/SQLite parity cases](../tests/test_v1_parity.py); **R** = [36 runtime tests](../tools/test_restoration_runtime.py), using synthetic acquisition/fake clocks where stated; **D** = [12 recovery tests](../tools/test_research_recovery.py). The other five application checks cover Node runtime selection and public build identity. These are portable execution receipts; they do not claim a browser run or live deployment.
+Evidence keys: **F** = [25 frontend Node checks](../tools/frontend_restore.test.mjs), including synthetic DOM rendering (not a browser); **A** = [12 actual Handler/SQLite parity cases](../tests/test_v1_parity.py); **R** = [36 runtime tests](../tools/test_restoration_runtime.py), using synthetic acquisition/fake clocks where stated; **D** = [19 recovery tests](../tools/test_research_recovery.py). The other five application checks cover Node runtime selection and public build identity. These are portable execution receipts; they do not claim a browser run or live deployment.
 
 ## Data, acquisition and baseline limits
 
@@ -29,6 +29,25 @@ Evidence keys: **F** = [20 frontend Node checks](../tools/frontend_restore.test.
 - Current cash quote ledger, provenance, provider control and pricing/freshness improvements remain separate from research benchmarks. Real personal data and private recovery artifacts remain local, outside Git and source/test bundles.
 
 ## Feature matrix
+
+### Focused cloud review corrections
+
+These findings reopened the affected source claims. The exact regression
+fixtures now pass; real-browser and fresh-clone execution remain separate stages.
+No finding establishes that original user databases were modified.
+
+| Stable follow-up | Finding | Owner and status | Required evidence |
+| --- | --- | --- | --- |
+| CS2-04/PRESET | Research portfolio preset controls update but table rebuild skips full search/metadata/price filters. | Fixed in `8406b468547ca03bf06eb05cbd97cc7443798c77`. | F actual select/apply/build/filter replay passes positive, negative, boundary, null-price and metadata cases, with inverted cash quotes, AND tags and exclusions. |
+| CS2-04/SELECTION | A pending inventory request can prevent the newly selected snapshot from issuing its own request. | Fixed in `8406b468547ca03bf06eb05cbd97cc7443798c77`. | F delayed A-to-B-to-A tests use actual load/reset/build functions; stale success, error and cleanup cannot affect the new request owner. |
+| CS2-04/ALL | Inherited Full Market query fallback changes All (0) into 90 days. | Fixed in `8406b468547ca03bf06eb05cbd97cc7443798c77`. | F query, cache and selector behavior preserves 0 versus ordinary 90; inherited bug is distinguished from restoration regressions. |
+| CS2-04/CHART-FALLBACK | Missing-Chart fallback expects a canvas while restored callers also pass a 2D context. | Fixed in `8406b468547ca03bf06eb05cbd97cc7443798c77`. | F both fallback inputs target the actual canvas and note; normal Chart receives the original input. |
+| CS2-04/RECOVERY-TRIGGERS | A research-table trigger can change protected clone settings while the receipt claims no personal changes. | Source fixed; protected-state proof required before commit. | D inherited pre-clone research/receipt triggers are refused; authorizer and independent post-write protected-state proof roll back unexpected writes. Normal FTS/idempotence pass. |
+| CS2-04/RECOVERY-WAL | Derived data committed in WAL can change recovered metrics without changing the recorded main-file hash. | Source fixed; closed inputs and actual snapshot identity enforced. | D committed open-WAL fixture is refused without changing source/main/WAL/SHM/target; closed WAL-header input works, and derived queries use the recorded snapshot. |
+
+The cloud review also reported that 18 anonymous mutation/forced-read negatives
+left its invented main and ledger table digests unchanged. That positive result
+does not replace the focused corrections above.
 
 Rows have the portable source coverage/limits listed and are included in the confirmed main publication above. Warm/Sync now use the continuing explicit job: Warm is bounded to 80 selected-portfolio items; Sync All batches only the selected portfolio, preserves cached history as its resume checkpoint, and reports an error rather than silently truncating scopes above 10,000. Browser and live stages remain **pending**, including rows that were retained at intake. "F source" is a source contract, not proof of each interaction. Root integration owns cutover and final live acceptance for every row.
 
