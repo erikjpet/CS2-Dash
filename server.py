@@ -9,6 +9,7 @@ valuation, taxonomy analysis, and group history.
 """
 
 import http.server
+import atexit
 import html
 import json
 import os
@@ -18,6 +19,7 @@ import socket
 import sqlite3
 import time
 import datetime
+import email.utils
 import gzip
 import hashlib
 import hmac
@@ -25,12 +27,49 @@ import secrets
 import http.cookiejar
 import math
 import threading
+import collections
+import http.client
+import contextlib
+import uuid
+import steam_held_asks
+import cash_prices
+import canonical_cash
+import compact_cash_service
+import holdings_cache
+import cash_cadence
+import bulk_derived_staging
+import generation_repository
+import generation_host
+import bulk_staging_host
+import bulk_staging_runtime
+import market_slice_cache
+import steam_request_governor
+import shutil
 import urllib.parse
 import urllib.request
 from collections import deque
+from contextlib import closing
+from pathlib import Path
+
+import catalog_store
 
 APP_NAME = 'cs2dash'
-APP_VERSION = '1.0'
+APP_VERSION = '1.0.1'
+CATALOG_STORE_ENABLED = os.environ.get('CS2DASH_CATALOG_STORE_ENABLED', '0').strip().lower() in ('1', 'true', 'yes')
+CATALOG_STORE_WRITES = os.environ.get('CS2DASH_CATALOG_STORE_WRITES', '0').strip().lower() in ('1', 'true', 'yes')
+CATALOG_COMPATIBILITY_FEED_ENABLED = os.environ.get('CS2DASH_CATALOG_COMPATIBILITY_FEED_ENABLED', '0').strip().lower() in ('1', 'true', 'yes')
+if CATALOG_COMPATIBILITY_FEED_ENABLED and not CATALOG_STORE_ENABLED:
+    raise RuntimeError('CS2DASH_CATALOG_COMPATIBILITY_FEED_ENABLED requires CS2DASH_CATALOG_STORE_ENABLED=1.')
+DERIVED_GENERATION_READS_ENABLED = False  # Explicit host admission only; no environment auto-activation.
+DERIVED_GENERATION_REPOSITORY = None
+CATALOG_INDEX_CACHE = None
+CATALOG_INDEX_LOCK = threading.Lock()
+ITEM_READ_PATHS = {
+    '/api/items', '/api/items/resolve', '/api/items/detail',
+    '/api/items/current', '/api/items/history', '/api/items/evidence', '/api/items/revisions',
+    '/api/items/payload',
+    '/api/items/legacy-streams', '/api/items/legacy-history',
+}
 
 # Config
 try:
@@ -53,7 +92,9 @@ DEFAULT_SYNC_STEAM_HISTORY_LIMIT = int(os.environ.get('CS2DASH_SYNC_STEAM_HISTOR
 ITEM_IDX      = {'n': 0, 'q': 1, 'pct': 2, 'd': 3, 'ct': 4, 'pt': 5, 'cat': 6, 'grp': 7}
 VOLATILITY_WINDOWS = {1, 3, 7, 14, 30, 60, 90, 180, 365, 0}
 VOLATILITY_DETAIL_WINDOWS = (7, 30, 90)
+RESEARCH_METRIC_WINDOWS = tuple(sorted(VOLATILITY_WINDOWS))
 OBSERVATION_BUCKET_SECONDS = 15 * 60
+PROVIDER_SNAPSHOT_INGESTION_VERSION = 1
 
 CATALOG_SOURCES = {
     'skins': 'https://raw.githubusercontent.com/ByMykel/CSGO-API/main/public/api/en/skins_not_grouped.json',
@@ -67,6 +108,21 @@ CATALOG_SOURCES = {
     'charms': 'https://raw.githubusercontent.com/ByMykel/CSGO-API/main/public/api/en/keychains.json',
 }
 
+# Keep the nine legacy source names and their listing identities unchanged.
+# The typed repository additionally covers published classes that have no safe
+# name-keyed legacy representation. Never ingest all.json alongside these feeds.
+CATALOG_LEGACY_KINDS = frozenset(CATALOG_SOURCES)
+CATALOG_REPOSITORY_SOURCES = {**CATALOG_SOURCES, **{
+    kind: 'https://raw.githubusercontent.com/ByMykel/CSGO-API/main/public/api/en/' + filename + '.json'
+    for kind, filename in (
+        ('agents', 'agents'), ('keys', 'keys'), ('collectibles', 'collectibles'),
+        ('sticker_slabs', 'sticker_slabs'), ('base_weapons', 'base_weapons'),
+        ('highlights', 'highlights'), ('pets', 'pets'), ('tools', 'inventory'))}}
+CATALOG_DOCUMENTED_INVENTORY_CATEGORIES = frozenset((
+    'skins', 'crates', 'collectibles', 'stickers', 'graffiti', 'music_kits',
+    'keychains', 'highlights', 'agents', 'patches', 'keys', 'sticker_slabs', 'tools', 'pets'))
+CATALOG_CONTRACT_VERSION = 1
+
 os.makedirs(DATA_DIR, exist_ok=True)
 
 LOCAL_ADDRS = {'127.0.0.1', '::1', '::ffff:127.0.0.1'}
@@ -76,14 +132,254 @@ SQLITE_WRITE_LOCK = threading.RLock()
 STEAM_REQUEST_LOCK = threading.Lock()
 DATA_TASK_LOCK = threading.RLock()
 DATA_TASKS = {}
+DATA_TASK_WORKERS = {}
+DATA_TASK_WAKE = threading.Event()
+DATA_TASK_STOP_EVENT = threading.Event()
+DATA_TASK_CLOCK = time.time
+DATA_TASK_MAX_WAIT_SECONDS = 24 * 60 * 60
 DATA_TASK_EVENTS = deque(maxlen=240)
 DATA_TASK_PERSIST_BACKLOG = deque(maxlen=600)
 DATA_TASK_PERSIST_NOTICE_AT = 0.0
 ACTIVE_DATA_TASK_ID = None
 DATA_TASK_RESUME_ENABLED = os.environ.get('DATA_TASK_RESUME_ENABLED', '1').strip().lower() not in ('0', 'false', 'no')
 DATA_TASK_RESUME_MAX_AGE_SECONDS = int(os.environ.get('DATA_TASK_RESUME_MAX_AGE_SECONDS', str(24 * 60 * 60)))
+# Pure, bounded single-item ask access; no startup fetch or database work.
+def validate_market_hash(value):
+    # Do not strip, normalize, guess variants, or accept a batch.
+    if (not isinstance(value, str) or not value or value != value.strip()
+            or len(value.encode('utf-8')) > 512
+            or any(ord(char) < 32 or 127 <= ord(char) < 160 for char in value)):
+        raise ValueError('One exact Steam market hash name is required (maximum 512 UTF-8 bytes).')
+    return value
+
+
+def parse_retry_after(value, now):
+    if not isinstance(value, str) or len(value) > 128:
+        return None
+    value = value.strip()
+    if value.isascii() and value.isdigit():
+        return int(now) + int(value)
+    try:
+        parsed = email.utils.parsedate_to_datetime(value)
+        if parsed.tzinfo is not None:
+            return max(int(now), int(parsed.timestamp()))
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return None
+
+
+class SteamRequestCooldown(Exception):
+    def __init__(self, state):
+        super().__init__('Steam requests paused by the shared cooldown')
+        self.state = dict(state)
+
+
+class SteamAccessGate:
+    """One process-wide pacing/deadline gate for existing history and new asks."""
+    def __init__(self, min_interval=1.25, not_before=0, clock=time.time, sleep=time.sleep):
+        self.lock = threading.Lock()
+        self.clock, self.sleep = clock, sleep
+        self.min_interval = max(0.0, float(min_interval))
+        self.last_request_at = 0.0
+        self.deadline = 0
+        self.reason = None
+        self.retry_after = None
+        self.upstream_retry_at = None
+        if not_before:
+            self.honor_deadline(int(not_before), 'operator_not_before')
+
+    def honor_deadline(self, deadline, reason='saved_history_retry_after'):
+        if type(deadline) is not int:
+            return
+        with self.lock:
+            if deadline > self.deadline:
+                self.deadline = deadline
+                self.reason = reason
+                self.retry_after = None
+                self.upstream_retry_at = deadline if reason == 'saved_history_retry_after' else None
+
+    def _state(self):
+        return {'retryAt': self.deadline, 'cooldownReason': self.reason,
+                'retryAfter': self.retry_after, 'upstreamRetryAt': self.upstream_retry_at}
+
+    def cooldown(self):
+        with self.lock:
+            return self._state() if self.deadline > self.clock() else None
+
+    def note_429(self, retry_after, upstream_retry_at):
+        with self.lock:
+            now = int(self.clock())
+            explicit = type(upstream_retry_at) is int and upstream_retry_at > now
+            deadline = upstream_retry_at if explicit else now + 3600
+            if deadline >= self.deadline:
+                self.deadline = deadline
+                self.reason = 'upstream_retry_after' if explicit else 'local_429_backoff'
+                self.retry_after = retry_after
+                self.upstream_retry_at = upstream_retry_at
+            return self._state()
+
+    def throttle(self, url):
+        if urllib.parse.urlsplit(str(url)).hostname != 'steamcommunity.com':
+            return
+        with self.lock:
+            if self.deadline > self.clock():
+                raise SteamRequestCooldown(self._state())
+            wait = self.min_interval - (self.clock() - self.last_request_at)
+            if wait > 0:
+                self.sleep(wait)
+            if self.deadline > self.clock():
+                raise SteamRequestCooldown(self._state())
+            self.last_request_at = self.clock()
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+class _NoSteamRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # Other providers retain their redirects, but cannot enter Steam outside its gate.
+        target = urllib.parse.urlsplit(newurl)
+        if (target.hostname or '').lower().rstrip('.') == 'steamcommunity.com':
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def parse_usd_ask(value):
+    # currency=1 and l=english must yield an unambiguous dollar amount.
+    if not isinstance(value, str) or len(value) > 40:
+        return None
+    match = re.fullmatch(r'\$(\d{1,9}|\d{1,3}(?:,\d{3}){1,2})\.(\d{2})(?: USD)?', value)
+    if not match:
+        return None
+    cents = int(match[1].replace(',', '')) * 100 + int(match[2])
+    return cents if 0 < cents <= 99999999999 else None
+
+
+class SteamCurrentAskService:
+    SUCCESS_TTL = 60
+    NEGATIVE_TTL = 300
+    MAX_ENTRIES = 64
+    MAX_RESPONSE_BYTES = 16384
+    TIMEOUT_SECONDS = 6
+
+    def __init__(self, gate, clock=time.time, open_url=None, retry_parser=parse_retry_after):
+        self.gate, self.clock = gate, clock
+        self.open_url = open_url
+        self.retry_parser = retry_parser
+        self.lock = threading.Lock()
+        self.cache = collections.OrderedDict()
+
+    def _base(self, name):
+        query = urllib.parse.urlencode({'appid': 730, 'currency': 1, 'l': 'english',
+                                       'market_hash_name': name})
+        return {'marketHashName': name, 'appid': 730, 'currency': 'USD', 'currencyId': 1,
+                'provider': 'steam', 'source': 'steam_priceoverview',
+                'priceBasis': 'lowest_ask', 'marketObservedAt': None,
+                'requestUrl': 'https://steamcommunity.com/market/priceoverview/?' + query,
+                'listingUrl': 'https://steamcommunity.com/market/listings/730/' + urllib.parse.quote(name, safe='')}
+
+    def _remember(self, name, result, ttl):
+        self.cache[name] = (self.clock() + ttl, dict(result))
+        self.cache.move_to_end(name)
+        while len(self.cache) > self.MAX_ENTRIES:
+            self.cache.popitem(last=False)
+        return result
+
+    def fetch(self, name, saved_deadline=None):
+        name = validate_market_hash(name)
+        base = self._base(name)
+        if not self.lock.acquire(blocking=False):
+            return dict(base, success=False, status='busy', error='Another Steam ask request is in progress.',
+                        fetchedAt=None, lowestAsk=None, cached=False)
+        try:
+            cached = self.cache.get(name)
+            if cached and cached[0] > self.clock():
+                result = dict(cached[1], cached=True)
+                if result['success']:
+                    result['status'] = 'cached'
+                self.cache.move_to_end(name)
+                return result
+            self.cache.pop(name, None)
+            if saved_deadline is not None:
+                try:
+                    self.gate.honor_deadline(saved_deadline())
+                except Exception:
+                    # No request when an existing persisted provider block cannot be checked.
+                    return self._remember(name, dict(base, success=False, status='unavailable',
+                        error='Steam cooldown state is unavailable. Try again later.',
+                        fetchedAt=None, lowestAsk=None, cached=False, retryAt=int(self.clock()) + 60), 60)
+            try:
+                blocked = self.gate.cooldown()
+                if blocked:
+                    raise SteamRequestCooldown(blocked)
+            except SteamRequestCooldown as exc:
+                return dict(base, success=False, status='cooldown', fetchedAt=None, lowestAsk=None,
+                            cached=False, httpStatus=None, error='Steam requests are paused.', **exc.state)
+            req = urllib.request.Request(base['requestUrl'], headers={
+                'User-Agent': 'CS2-Dash/SteamCurrentAsk', 'Accept': 'application/json',
+                'Accept-Language': 'en-US,en;q=0.9', 'Accept-Encoding': 'identity'})
+            try:
+                # A fresh opener has no cookie processor, account state, or redirect fallback.
+                opener = self.open_url or urllib.request.build_opener(_NoRedirect()).open
+                with opener(req, timeout=self.TIMEOUT_SECONDS) as response:
+                    if response.geturl() != base['requestUrl'] or response.status != 200:
+                        raise ValueError('Unexpected Steam response target or status')
+                    if response.headers.get('Content-Encoding', 'identity').lower() not in ('', 'identity'):
+                        raise ValueError('Unexpected compressed Steam response')
+                    body = response.read(self.MAX_RESPONSE_BYTES + 1)
+                    if len(body) > self.MAX_RESPONSE_BYTES:
+                        raise ValueError('Steam response exceeded the size limit')
+                    data = json.loads(body.decode('utf-8'))
+                received_precise = self.clock()
+                received_at = int(received_precise)
+                if not isinstance(data, dict) or data.get('success') is not True:
+                    raise ValueError('Steam did not provide a successful price response')
+                # priceoverview does not echo item identity: bind only to the exact fixed request URL.
+                # If an upstream identity/currency appears, reject any mismatch rather than relabel it.
+                if (data.get('market_hash_name', name) != name
+                        or type(data.get('currency', 'USD')) is bool
+                        or data.get('currency', 'USD') not in ('USD', 1, '1')
+                        or data.get('appid', 730) not in (730, '730')):
+                    raise ValueError('Steam response identity or currency did not match the request')
+                cents = parse_usd_ask(data.get('lowest_price'))
+                if cents is None:
+                    return self._remember(name, dict(base, success=False, status='unavailable',
+                        error='Steam did not return a valid USD lowest ask.', lowestAsk=None,
+                        fetchedAt=received_at, cached=False, retryAt=received_at + self.NEGATIVE_TTL), self.NEGATIVE_TTL)
+                # volume is traded volume, never quantity available for sale. Do not expose it here.
+                return self._remember(name, dict(base, success=True, status='fetched',
+                    receiptId=uuid.uuid4().hex, receivedAtMicros=int(received_precise * 1000000),
+                    lowestAsk=cents / 100, lowestAskCents=cents, rawLowestPrice=data['lowest_price'], fetchedAt=received_at,
+                    expiresAt=received_at + self.SUCCESS_TTL, cached=False,
+                    identityEvidence='exact_request_url; response does not normally echo identity'), self.SUCCESS_TTL)
+            except urllib.error.HTTPError as exc:
+                code = exc.code
+                raw_retry = exc.headers.get('Retry-After') if exc.headers is not None else None
+                retry_after = raw_retry if isinstance(raw_retry, str) and len(raw_retry) <= 128 else None
+                exc.close()
+                if code == 429:
+                    state = self.gate.note_429(retry_after, self.retry_parser(retry_after, int(self.clock())))
+                    return dict(base, success=False, status='rate_limited', fetchedAt=None, lowestAsk=None,
+                        cached=False, httpStatus=429, error='Steam rate limited this request (HTTP 429).', **state)
+                return self._remember(name, dict(base, success=False, status='failed', fetchedAt=None,
+                    lowestAsk=None, cached=False, httpStatus=code, error='Steam ask request failed.',
+                    retryAt=int(self.clock()) + self.NEGATIVE_TTL), self.NEGATIVE_TTL)
+            except (OSError, ValueError, UnicodeError, RecursionError, http.client.HTTPException):
+                return self._remember(name, dict(base, success=False, status='failed', fetchedAt=None,
+                    lowestAsk=None, cached=False, error='Steam ask request failed or returned an invalid response.',
+                    retryAt=int(self.clock()) + self.NEGATIVE_TTL), self.NEGATIVE_TTL)
+        finally:
+            self.lock.release()
+
+
 STEAM_LAST_REQUEST_AT = 0.0
 STEAM_MIN_INTERVAL = float(os.environ.get('STEAM_MIN_INTERVAL', '1.25'))
+STEAM_ACCESS_GATE = SteamAccessGate(STEAM_MIN_INTERVAL, os.environ.get('CS2DASH_STEAM_RETRY_NOT_BEFORE', '0'))
+STEAM_CURRENT_ASK = SteamCurrentAskService(STEAM_ACCESS_GATE,
+    open_url=lambda request, timeout: steam_ask_public_open(request, timeout),
+    retry_parser=lambda value, now: steam_retry_after_timestamp(value, now))
 MARKET_REFRESH_INTERVAL_SECONDS = int(os.environ.get('MARKET_REFRESH_INTERVAL_SECONDS', str(6 * 60 * 60)))
 AUTO_MARKET_REFRESH = os.environ.get('AUTO_MARKET_REFRESH', '1').strip().lower() not in ('0', 'false', 'no')
 MARKET_BULK_SOURCE = os.environ.get('MARKET_BULK_SOURCE', 'any').strip().lower()
@@ -123,6 +419,14 @@ PRIMARY_PRICE_PROVIDER_ORDER = CURRENT_PRICE_PROVIDERS
 METRIC_BUILD_VERSION = 6
 LOOKUP_BUILD_VERSION = 16
 COLLECTION_CASE_ALIAS_CACHE = None
+AUTO_REFRESH_STATUS_LOCK = threading.Lock()
+AUTO_REFRESH_STATUS = {}
+IDLE_WAL_ANCHOR = None
+IDLE_WAL_ANCHOR_OWNER = None
+IDLE_WAL_ANCHOR_ATEXIT_REGISTERED = False
+CASH_PRICE_SERVICE = None
+CASH_PRICE_HOLDINGS_CACHE = None
+CASH_PRICE_SERVICE_LOCK = threading.Lock()
 
 # --- Authentication / hardening ---
 # Bind to loopback by default so the app is only reachable through a reverse
@@ -141,6 +445,9 @@ SESSION_TTL_SECONDS = int(os.environ.get('CS2DASH_SESSION_TTL', str(30 * 24 * 60
 # reverse proxy the browser connection is HTTPS, so this should stay on. Set
 # CS2DASH_COOKIE_SECURE=0 only when testing over plain HTTP locally.
 COOKIE_SECURE = (os.environ.get('CS2DASH_COOKIE_SECURE', '1') or '1').strip().lower() not in ('0', 'false', 'no')
+# Public mode exposes a narrow read-only view while keeping every write behind
+# the existing single-user login. It is off by default.
+PUBLIC_READONLY = (os.environ.get('CS2DASH_PUBLIC_READONLY', '') or '').strip().lower() in ('1', 'true', 'yes')
 # Reject oversized request bodies before reading them into memory.
 MAX_BODY_BYTES = int(os.environ.get('CS2DASH_MAX_BODY_BYTES', str(64 * 1024 * 1024)) or (64 * 1024 * 1024))
 # Resolved at startup by resolve_auth_hash().
@@ -148,6 +455,27 @@ AUTH_HASH = ''
 PBKDF2_ITERATIONS = 200000
 PUBLIC_GET_PATHS = {'/login', '/favicon.ico', '/api/health'}
 PUBLIC_POST_PATHS = {'/api/login'}
+ANON_GET_PATHS = {
+    '/api/cash-value', '/api/cash-price-jobs',
+    '/api/canonical-cash-value', '/api/canonical-cash-prices',
+    '/api/steam-ask-value', '/api/steam-ask-jobs',
+    '/', '/index.html', '/report', '/api/status', '/api/snaps',
+    '/api/portfolios', '/api/access', '/api/catalog', '/api/prices',
+    '/api/history', '/api/analysis', '/api/market-universe',
+    '/api/market-items', '/api/taxonomy-analysis', '/api/group-history',
+    '/api/group-item-history', '/api/inventory',
+    '/api/shared-pricing-status', '/api/shared-item-pricing',
+    '/api/market-universe-status', '/api/data-tasks',
+}
+
+
+def anon_sanitize_query(query):
+    """Return anonymous query parameters with every refresh control disabled."""
+    sanitized = {key: list(values) for key, values in query.items()}
+    for key in ('force', 'refresh', 'refresh_history'):
+        sanitized[key] = ['0']
+    sanitized['refresh_limit'] = ['0']
+    return sanitized
 
 
 def hash_password(password, iterations=PBKDF2_ITERATIONS, salt=None):
@@ -193,13 +521,13 @@ def create_session(username):
     return token
 
 
-def get_session_user(token):
+def get_session_user(token, readonly=False):
     if not token:
         return None
     now = int(time.time())
     username = None
     expired = False
-    with db() as conn:
+    with (closing(catalog_read_db()) if readonly else db()) as conn:
         row = conn.execute(
             'SELECT username,expires_at FROM auth_sessions WHERE token=?', (token,)
         ).fetchone()
@@ -208,7 +536,8 @@ def get_session_user(token):
         username = row['username']
         expired = row['expires_at'] < now
     if expired:
-        delete_session(token)
+        if not readonly:
+            delete_session(token)
         return None
     return username
 
@@ -446,6 +775,10 @@ def persist_data_task_update(task=None, event=None):
 
 
 def data_task_event(task_id, stage, message, **payload):
+    return _record_data_task_event(task_id, stage, message, payload)
+
+
+def _record_data_task_event(task_id, stage, message, payload, defer_persistence=False):
     event = {
         'taskId': task_id,
         'ts': int(time.time()),
@@ -467,7 +800,12 @@ def data_task_event(task_id, stage, message, **payload):
             task_copy = compact_data_task(task)
         else:
             task_copy = None
-    persist_data_task_update(task_copy, event)
+        if defer_persistence:
+            # Provider transaction progress must never open a second writer.
+            # Its next ordinary/post-commit event drains these exact records.
+            DATA_TASK_PERSIST_BACKLOG.append({'task': task_copy, 'event': event})
+    if not defer_persistence:
+        persist_data_task_update(task_copy, event)
     print(f"  data-task[{task_id}] {stage}: {message}")
     return event
 
@@ -475,8 +813,14 @@ def data_task_event(task_id, stage, message, **payload):
 def data_task_snapshot():
     with DATA_TASK_LOCK:
         should_flush = bool(DATA_TASK_PERSIST_BACKLOG)
-    if should_flush:
-        persist_data_task_update()
+    # A status poll must not queue behind a provider transaction. Keep the
+    # idle retry for deferred records; event/terminal updates still persist
+    # through their existing writer path when that transaction completes.
+    if should_flush and SQLITE_WRITE_LOCK.acquire(blocking=False):
+        try:
+            persist_data_task_update()
+        finally:
+            SQLITE_WRITE_LOCK.release()
     with DATA_TASK_LOCK:
         tasks = sorted(DATA_TASKS.values(), key=lambda t: t.get('startedAt') or 0, reverse=True)[:8]
         return {
@@ -492,7 +836,7 @@ def data_task_snapshot():
 def latest_data_task_active():
     with DATA_TASK_LOCK:
         active = DATA_TASKS.get(ACTIVE_DATA_TASK_ID) if ACTIVE_DATA_TASK_ID else None
-        return bool(active and active.get('status') in ('queued', 'running'))
+        return bool(active and active.get('status') in ('queued', 'running', 'waiting'))
 
 
 def restore_data_tasks_from_db(conn):
@@ -516,7 +860,7 @@ def restore_data_tasks_from_db(conn):
         task = _data_task_from_row(row, events_by_task.get(row.get('id'), [])[-80:])
         status = task.get('status')
         age = now - int(task.get('updatedAt') or task.get('createdAt') or now)
-        if status in ('queued', 'running'):
+        if status in ('queued', 'running', 'waiting'):
             if age <= DATA_TASK_RESUME_MAX_AGE_SECONDS:
                 task['status'] = 'queued'
                 task['stage'] = 'queued'
@@ -574,16 +918,471 @@ def resume_persisted_data_task():
         name=f"data-task-{task_id}-resume",
         daemon=True,
     )
+    with DATA_TASK_LOCK:
+        DATA_TASK_WORKERS[task_id] = thread
     thread.start()
     return True
 
 
+BULK_STAGING_HOST = None
+
+
+class CanonicalReadCompatibleRuntime(generation_host.Runtime):
+    """Preserve one exact paused adoption across a read/UI-only source update.
+
+    No saved source identity is rewritten. The original builder remains paused;
+    starting it under a new source requires explicit normal adoption. Rolling
+    back the source restores the exact original saved adoption unchanged.
+    """
+    compatibility_paused = False
+
+    def restore(self):
+        with closing(self.ns['steam_ask_db']()) as conn:
+            operator = bulk_derived_staging.get_json(conn, 'bulk_staging_operator:v1')
+            abi = bulk_derived_staging.get_setting(conn, bulk_derived_staging.ABI_KEY)
+            saved_status = bulk_derived_staging.get_json(conn, 'bulk_staging_runtime_status:v1') or {}
+        sha, signature = self.source_identity()
+        if not operator or operator.get('sourceSHA256') == sha:
+            return super().restore()
+        components, signatures = self.component_identity()
+        if (operator.get('sourceSHA256') != '5b6ad1a5f140e7d9ed6fe6cb526ded2f0d755ae53c45871713673fda3f2a8788'
+                or operator.get('paused') is not True or operator.get('componentSHA256') != components
+                or abi != bulk_derived_staging.WRITER_ABI):
+            raise bulk_derived_staging.Deferred('Saved paused adoption is not compatible with canonical read update')
+        self.native_guard()
+        operator = dict(operator, policy=generation_host.legacy_runtime.policy_checked(operator['policy'], self.approved_root))
+        # Existing policy/schema/components remain byte identical; only the
+        # running read-only consumer source identity changes in memory.
+        self.operator = dict(operator, sourceSHA256=sha)
+        self._source_signature, self._component_signatures = signature, signatures
+        self.paused, self.compatibility_paused = True, True
+        self.host = self._build_host()
+        self.ns['BULK_STAGING_HOST'] = self.host
+        # Builder pause must not reject ordinary saved reads. No pointer has
+        # been published in this transition; retain the legacy read factory.
+        self.ns['DERIVED_GENERATION_READS_ENABLED'] = False
+        self.last.update(saved_status)
+        self.uncertain = saved_status.get('uncertainPublishToken')
+        self.last.update(state='compatible_paused_source', paused=True)
+        return self.snapshot()
+
+    def control(self, data):
+        if self.compatibility_paused:
+            if isinstance(data, dict) and data == {'action': 'pause'}:
+                return self.snapshot()
+            raise bulk_derived_staging.Deferred('Explicit requalification/adoption is required before resuming the old builder')
+        return super().control(data)
+
+
+BULK_STAGING_RUNTIME = CanonicalReadCompatibleRuntime(globals())
+
+
+def bulk_staging_enabled(conn):
+    return BULK_STAGING_HOST is not None and bulk_staging_adopted(conn)
+
+
+def bulk_staging_adopted(conn):
+    abi = bulk_derived_staging.get_setting(conn, bulk_derived_staging.ABI_KEY)
+    if abi is not None and abi != bulk_derived_staging.WRITER_ABI:
+        raise bulk_derived_staging.Deferred('Saved derived ABI requires explicit v3 adoption')
+    selected = abi == bulk_derived_staging.WRITER_ABI
+    if selected:
+        BULK_STAGING_RUNTIME.native_guard()
+    return selected
+
+
+def bulk_staging_cash_revision(conn, lane):
+    if bulk_staging_adopted(conn):
+        bulk_derived_staging.invalidate_inputs(conn, lane)
+        BULK_STAGING_RUNTIME.request()
+
+
+def bulk_staging_queue_pending(conn):
+    flush_market_source_revision(conn)
+    return bulk_derived_staging.invalidate_inputs(conn, 'csgotrader_complete_snapshot')
+
+
+class MarketWriteConnection(sqlite3.Connection):
+    """Coalesce source revision invalidation within each write transaction."""
+    _market_dirty = False
+
+    def flush_market_revision(self):
+        if self._market_dirty:
+            super().execute("INSERT OR REPLACE INTO settings(key,value) VALUES('market_source_revision',?)",(str(time.time_ns()),))
+            if bulk_staging_adopted(self):
+                bulk_derived_staging.invalidate_inputs(self, 'market_source_or_metadata')
+                BULK_STAGING_RUNTIME.request()
+            self._market_dirty = False
+
+    def commit(self):
+        self.flush_market_revision()
+        return super().commit()
+
+    def rollback(self):
+        self._market_dirty = False
+        return super().rollback()
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if exc_type is None:
+            try:
+                self.flush_market_revision()
+            except BaseException:
+                self.rollback()
+                raise
+        else:
+            self._market_dirty = False
+        return super().__exit__(exc_type,exc_value,traceback)
+
+
 def db(timeout_ms=None):
     timeout_ms = SQLITE_BUSY_TIMEOUT_MS if timeout_ms is None else timeout_ms
-    conn = sqlite3.connect(DB_FILE, timeout=timeout_ms / 1000)
+    conn = sqlite3.connect(DB_FILE, timeout=timeout_ms / 1000, factory=MarketWriteConnection)
     conn.row_factory = sqlite3.Row
     conn.execute(f"PRAGMA busy_timeout={timeout_ms}")
     return conn
+
+
+def close_idle_wal_anchor():
+    """Close only on the startup thread; also safe as an atexit callback."""
+    global IDLE_WAL_ANCHOR, IDLE_WAL_ANCHOR_OWNER
+    if IDLE_WAL_ANCHOR is None:
+        return True
+    if threading.get_ident() != IDLE_WAL_ANCHOR_OWNER:
+        print('  Idle WAL anchor close deferred to its owning startup thread.')
+        return False
+    try:
+        IDLE_WAL_ANCHOR.close()
+    except sqlite3.Error as error:
+        print(f'  Idle WAL anchor close failed: {error}')
+        return False
+    IDLE_WAL_ANCHOR = None
+    IDLE_WAL_ANCHOR_OWNER = None
+    return True
+
+
+def start_idle_wal_anchor():
+    """Keep one idle read-only pager attached, without holding a read snapshot."""
+    global IDLE_WAL_ANCHOR, IDLE_WAL_ANCHOR_OWNER, IDLE_WAL_ANCHOR_ATEXIT_REGISTERED
+    if threading.current_thread() is not threading.main_thread():
+        print('  Idle WAL anchor unavailable outside the startup thread; normal connections remain in use.')
+        return False
+    if IDLE_WAL_ANCHOR is not None:
+        return True
+    option = getattr(sqlite3, 'SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE', None)
+    if option is None or not all(hasattr(sqlite3.Connection, name) for name in ('setconfig', 'getconfig')):
+        print('  Idle WAL anchor unavailable: NO_CKPT_ON_CLOSE requires supported Python/SQLite; normal startup continues.')
+        return False
+    connection = None
+    try:
+        connection = sqlite3.connect(Path(DB_FILE).resolve().as_uri() + '?mode=ro',
+                                     uri=True, timeout=0, isolation_level=None)
+        connection.setconfig(option, False)
+        if connection.getconfig(option):
+            raise RuntimeError('Idle anchor last-close cleanup could not be enabled')
+        # A constant SELECT 1 does not necessarily attach the database pager.
+        # Consume and close this exact-key cursor before leaving startup.
+        cursor = connection.execute("SELECT value FROM settings WHERE key='market_source_revision'")
+        try:
+            cursor.fetchall()
+        finally:
+            cursor.close()
+        if connection.in_transaction:
+            raise RuntimeError('idle anchor unexpectedly entered a transaction')
+        if not IDLE_WAL_ANCHOR_ATEXIT_REGISTERED:
+            atexit.register(close_idle_wal_anchor)
+            IDLE_WAL_ANCHOR_ATEXIT_REGISTERED = True
+        IDLE_WAL_ANCHOR = connection
+        IDLE_WAL_ANCHOR_OWNER = threading.get_ident()
+        print('  Idle read-only WAL anchor attached; no read transaction retained.')
+        return True
+    except (sqlite3.Error, OSError, RuntimeError, ValueError) as error:
+        if connection is not None:
+            try:
+                connection.close()
+            except sqlite3.Error:
+                pass
+        print(f'  Idle WAL anchor unavailable: {error}; normal startup continues.')
+        return False
+
+
+def catalog_read_db():
+    """Open the existing database without creating files or repairing data."""
+    if DERIVED_GENERATION_READS_ENABLED:
+        if DERIVED_GENERATION_REPOSITORY is None:
+            raise RuntimeError('Generation reader admission is not configured.')
+        return DERIVED_GENERATION_REPOSITORY.reader()
+    conn = sqlite3.connect(Path(DB_FILE).resolve().as_uri() + '?mode=ro', uri=True,
+                           timeout=SQLITE_BUSY_TIMEOUT_MS / 1000)
+    conn.row_factory = sqlite3.Row
+    conn.execute('PRAGMA query_only=ON')
+    return conn
+
+
+def require_catalog_store(conn):
+    store = catalog_store.CatalogStore(conn)
+    if not store.ready():
+        raise RuntimeError('Catalog migration is required before enabling the catalog repository.')
+    return store
+
+
+def catalog_writer(conn):
+    if not CATALOG_STORE_ENABLED:
+        return None
+    if not CATALOG_STORE_WRITES:
+        raise RuntimeError('Catalog writes are paused; keep CS2 data refresh paused until writer activation.')
+    return require_catalog_store(conn)
+
+
+def catalog_identity_for_legacy(conn, name, market_hash_name=None, source='legacy', unresolved_definition=None):
+    store = catalog_writer(conn)
+    if store is None:
+        return None, None
+    exact_name = market_hash_name or name
+    meta = catalog_meta_for_name(conn, exact_name) or infer_market_meta_from_name(exact_name) or {}
+    if not catalog_row_is_market_listing(meta):
+        if unresolved_definition is not None:
+            unresolved_definition.update(status='unresolved_definition',
+                reason=(meta.get('_marketProjection') or {}).get('reason') or 'metadata_entity',
+                metadataKind=meta.get('kind'), metadataName=meta.get('name'))
+            return store, None
+        raise catalog_store.IdentityConflict('Published definition has no verified exact market listing: ' + exact_name)
+    item_id = store.ensure_item({
+        'name': exact_name, 'market_hash_name': exact_name,
+        'entity_type': 'listing', 'kind': meta.get('kind') or 'market_listing',
+        'metadata': {
+            'kind': meta.get('kind') or 'market_listing',
+            'type': meta.get('item_type'), 'weapon': meta.get('weapon'),
+            'collection': meta.get('collection'), 'rarity': meta.get('rarity'),
+            'rarityColor': meta.get('rarity_color'), 'image': meta.get('image'),
+        },
+    }, source=source)
+    return store, item_id
+
+
+def catalog_sync_legacy_metadata(conn, table, names=None, records=None, reconcile_raw=True):
+    """Mirror final metadata only; current quote values remain in native rows.
+
+    Call from the caller's existing writer transaction after legacy changes.
+    Stable exact identifiers connect feed-published entities to their legacy
+    metadata projection. No speculative price bindings or raw copies are made.
+    """
+    if not CATALOG_STORE_ENABLED:
+        return 0
+    if table not in ('item_catalog', 'market_items'):
+        raise ValueError('only current public metadata projections are supported')
+    store = catalog_writer(conn)
+    fields = ('name', 'kind', 'item_type', 'weapon', 'collection', 'rarity',
+              'rarity_color', 'image', 'market_hash_name')
+    if records is None:
+        if names is None:
+            raise ValueError('explicit affected metadata names required')
+        names = list(dict.fromkeys(names))
+        records = []
+        for offset in range(0, len(names), 200):
+            chunk = names[offset:offset + 200]
+            records.extend(dict(row) for row in conn.execute(
+                'SELECT ' + ','.join(fields) + (',raw' if reconcile_raw else '') + ',updated_at FROM ' + table +
+                ' WHERE name IN (' + ','.join('?' for _ in chunk) + ')', chunk))
+    source = 'legacy:' + table
+    changed = 0
+    for value in records:
+        row = dict(value)
+        record = {field: row.get(field) for field in fields}
+        name = record['name']
+        if not isinstance(name, str) or not name:
+            raise ValueError('nonempty exact metadata name required')
+        kind = record.get('kind')
+        entity_type = {'collections': 'collection', 'skin_families': 'skin_family'}.get(kind, 'listing')
+        namespace = source + ':' + str(kind or '')
+        record['identifiers'] = [(namespace, name)]
+        record['raw_ref'] = {'store': table, 'name': name}
+        record_source = store._legacy_record_source(source, name)
+        owners = conn.execute('''SELECT i.item_id,i.entity_type,m.metadata_json,m.raw_ref_json,m.active
+            FROM catalog_identifiers_v2 x JOIN catalog_items_v2 i ON i.item_id=x.item_id
+            LEFT JOIN catalog_metadata_v2 m ON m.item_id=i.item_id AND m.source IN (?,?)
+            WHERE x.namespace=? AND x.value=?
+            ORDER BY CASE WHEN m.source=? THEN 0 ELSE 1 END LIMIT 2''',
+            (record_source, source, namespace, name, record_source)).fetchall()
+        owner = owners[0] if owners else None
+        if owner and owner['entity_type'] != entity_type:
+            raise catalog_store.IdentityConflict('current metadata entity type changed')
+        evidence = None
+        for candidate in owners:
+            reference = json.loads(candidate['raw_ref_json'] or '{}')
+            if isinstance(reference, dict) and reference.get('store') == table and reference.get('name') == name:
+                evidence = candidate
+                break
+        previous_metadata = json.loads(evidence['metadata_json'] or '{}') if evidence else {}
+        if not reconcile_raw and evidence:
+            # A quote-only ensure does not modify upstream raw evidence. Avoid
+            # reading/parsing it again only when evidence belongs to this exact
+            # physical name. Another alias's canonical snapshot is insufficient.
+            if 'external_id' in previous_metadata:
+                record['external_id'] = previous_metadata['external_id']
+        else:
+            if 'raw' not in row:
+                saved_raw = conn.execute('SELECT raw FROM ' + table + ' WHERE name=?', (name,)).fetchone()
+                row['raw'] = saved_raw['raw'] if saved_raw else None
+            raw = row.get('raw')
+            try:
+                raw = json.loads(raw) if isinstance(raw, (str, bytes, bytearray)) else raw
+            except (TypeError, ValueError):
+                raw = None
+            if isinstance(raw, dict) and raw.get('id') is not None:
+                record['external_id'] = raw['id']
+        desired = {field: record[field] for field in fields}
+        desired.update(type=record.get('item_type'), rarityColor=record.get('rarity_color'))
+        if 'external_id' in record:
+            desired['external_id'] = record['external_id']
+        if owner:
+            item_id = owner['item_id']
+            same = bool(evidence and evidence['active'] and previous_metadata == desired
+                        and json.loads(evidence['raw_ref_json'] or '{}') == record['raw_ref'])
+        else:
+            # Locate an existing strong/feed identity before adding a legacy
+            # identifier, including nonpriceable families without Steam hashes.
+            keys = store._identifiers(record, source, entity_type)
+            if table == 'item_catalog':
+                feed_record = {key: val for key, val in record.items() if key != 'identifiers'}
+                keys += store._identifiers(feed_record, 'catalog:' + str(kind or ''), entity_type)
+            owners = {found['item_id'] for key, val in keys for found in conn.execute(
+                'SELECT item_id FROM catalog_identifiers_v2 WHERE namespace=? AND value=?', (key, val))}
+            if len(owners) > 1:
+                raise catalog_store.IdentityConflict('current metadata identifiers have conflicting owners')
+            item_id = next(iter(owners)) if owners else None
+            same = False
+        changed_item = not same
+        if changed_item:
+            if item_id is not None:
+                record['item_id'] = item_id
+            item_id = store.ensure_item(record, source=source,
+                                        attempted_at=row.get('updated_at') or int(time.time()))
+        if table == 'item_catalog':
+            # The upstream raw reference and source success receipt remain
+            # intact. Only the final normalized fields (e.g. collection backfill)
+            # override the feed's earlier normalization in the compatibility DTO.
+            feed = conn.execute('''SELECT metadata_json FROM catalog_metadata_v2
+                WHERE item_id=? AND source=? AND active=1''', (item_id, 'catalog:' + str(kind or ''))).fetchone()
+            if feed:
+                metadata = json.loads(feed['metadata_json'])
+                final = {**metadata, **{field: desired[field] for field in fields},
+                         'type': desired['type'], 'rarityColor': desired['rarityColor']}
+                if final != metadata:
+                    final['normalizationSource'] = source
+                    conn.execute('''UPDATE catalog_metadata_v2 SET metadata_json=?,updated_at=?
+                        WHERE item_id=? AND source=?''',
+                        (json.dumps(final, ensure_ascii=False, sort_keys=True, separators=(',', ':')),
+                         row.get('updated_at') or int(time.time()), item_id, 'catalog:' + str(kind or '')))
+                    if not changed_item:
+                        store._bump_generation()
+                    changed_item = True
+        if changed_item:
+            changed += 1
+    return changed
+
+
+def catalog_read_payload(path, query):
+    if not CATALOG_STORE_ENABLED:
+        return {'ok': False, 'error': 'Catalog repository is disabled; migration and explicit activation are required.'}, 503
+    if path == '/api/catalog' and not CATALOG_COMPATIBILITY_FEED_ENABLED:
+        return {'ok': False, 'error': 'The monolithic native compatibility feed is disabled; use cursor-paged /api/items with include_quotes=false.'}, 503
+    try:
+        with closing(catalog_read_db()) as conn:
+            conn.execute('BEGIN')
+            # Exact physical history is addressable before registry seeding.
+            # These reads never mint an ID or infer a Steam listing identity.
+            if path in ('/api/items/legacy-streams', '/api/items/legacy-history'):
+                store = catalog_store.CatalogStore(conn)
+                legacy_store = query.get('store', [''])[0]
+                limit = parse_int_param(query.get('limit', ['100'])[0],100,minimum=1,maximum=500)
+                cursor = query.get('cursor',[None])[0]
+                if path == '/api/items/legacy-streams':
+                    return {'ok':True, **store.discover_legacy_streams_batch(
+                        legacy_store,cursor=cursor,limit=limit,max_queries=400,seconds=1)},200
+                name = query.get('name',[''])[0]
+                if not name:
+                    return {'ok':False,'error':'Missing exact name'},400
+                return {'ok':True, **store.lookup_legacy(
+                    legacy_store,name,provider=query.get('provider',[None])[0],
+                    lane=query.get('lane',[None])[0],source=query.get('source',[None])[0],
+                    limit=limit,cursor=cursor,max_queries=400,seconds=1)},200
+            store = require_catalog_store(conn)
+            if path == '/api/catalog':
+                return catalog_payload_from_store(store), 200
+            if path == '/api/items':
+                priced_value = query.get('priced', [None])[0]
+                if priced_value is None:
+                    priced = None
+                elif str(priced_value).lower() in ('1', 'true', 'yes'):
+                    priced = True
+                elif str(priced_value).lower() in ('0', 'false', 'no'):
+                    priced = False
+                else:
+                    raise ValueError('priced must be true or false')
+                include_quotes_value = str(query.get('include_quotes', ['true'])[0]).lower()
+                if include_quotes_value in ('1', 'true', 'yes'):
+                    include_quotes = True
+                elif include_quotes_value in ('0', 'false', 'no'):
+                    include_quotes = False
+                else:
+                    raise ValueError('include_quotes must be true or false')
+                return {'ok': True, **store.list_items(
+                    query=query.get('query', query.get('search', ['']))[0],
+                    limit=parse_int_param(query.get('limit', ['100'])[0], 100, minimum=1, maximum=500),
+                    cursor=query.get('cursor', [None])[0],
+                    entity_type=query.get('entity_type', [None])[0],
+                    priced=priced,
+                    query_mode=query.get('query_mode', ['contains'])[0],
+                    include_quotes=include_quotes,
+                ), 'coverage': store.status()}, 200
+            if path == '/api/items/resolve':
+                value = query.get('value', query.get('name', ['']))[0]
+                if not value:
+                    return {'ok': False, 'error': 'Missing value'}, 400
+                return {'ok': True, **store.resolve(value, namespace=query.get('namespace', [None])[0])}, 200
+            if path == '/api/items/payload':
+                payload_id = query.get('payload_id', [''])[0]
+                if not payload_id:
+                    return {'ok': False, 'error': 'Missing payload_id'}, 400
+                payload = store.get_payload(payload_id)
+                if payload is None:
+                    return {'ok': False, 'error': 'Payload not found'}, 404
+                return {'ok': True, 'payload': payload}, 200
+            item_id = query.get('id', [''])[0]
+            if not item_id:
+                return {'ok': False, 'error': 'Missing id'}, 400
+            item = store.get_item(item_id)
+            if item is None:
+                return {'ok': False, 'error': 'Item not found'}, 404
+            if path == '/api/items/detail':
+                return {'ok': True, 'item': item}, 200
+            if path == '/api/items/current':
+                return {'ok': True, 'itemId': item_id, **store.current_quotes(item_id)}, 200
+            if path == '/api/items/evidence':
+                return {'ok': True, 'itemId': item_id,
+                        'evidence': store.get_evidence(item_id, source=query.get('source', [None])[0])}, 200
+            if path == '/api/items/revisions':
+                point_key = query.get('point_key', [''])[0]
+                if not point_key:
+                    return {'ok': False, 'error': 'Missing point_key'}, 400
+                return {'ok': True, **store.get_revisions(
+                    item_id, point_key, provider=query.get('provider', ['steam'])[0],
+                    limit=parse_int_param(query.get('limit', ['100'])[0], 100, minimum=1, maximum=500),
+                    cursor=query.get('cursor', [None])[0],
+                )}, 200
+            if path == '/api/items/history':
+                return {'ok': True, 'itemId': item_id, **store.history(
+                    item_id, kind=query.get('kind', ['auto'])[0],
+                    limit=parse_int_param(query.get('limit', ['200'])[0], 200, minimum=1, maximum=1000),
+                    cursor=query.get('cursor', [None])[0],
+                    provider=query.get('provider', [None])[0],
+                    lane=query.get('lane', [None])[0], source=query.get('source', [None])[0],
+                )}, 200
+    except (RuntimeError, sqlite3.OperationalError):
+        return {'ok': False, 'error': 'Catalog repository is unavailable; complete the explicit catalog migration before activation.'}, 503
+    except (ValueError, KeyError, TypeError) as exc:
+        return {'ok': False, 'error': str(exc)}, 400
+    return {'ok': False, 'error': 'Unknown item route'}, 404
 
 
 def add_missing_columns(conn, table, specs):
@@ -948,28 +1747,28 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_data_tasks_status_updated ON data_tasks(status, updated_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_data_task_events_task_id ON data_task_events(task_id, id)")
 
-        if conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0] == 0:
+        if not conn.execute("SELECT 1 FROM snapshots LIMIT 1").fetchone():
             for idx, snap in enumerate(read_json(SNAPS_FILE, [])):
                 put_snapshot(conn, snap, idx)
 
-        if conn.execute("SELECT COUNT(*) FROM settings").fetchone()[0] == 0:
+        if not conn.execute("SELECT 1 FROM settings LIMIT 1").fetchone():
             settings = read_json(SETTINGS_FILE, {})
             conn.execute(
                 "INSERT OR REPLACE INTO settings(key,value) VALUES('shared',?)",
                 (json.dumps(settings),),
             )
-        if conn.execute("SELECT COUNT(*) FROM snapshot_items").fetchone()[0] == 0:
+        if not conn.execute("SELECT 1 FROM snapshot_items LIMIT 1").fetchone():
             rebuild_item_index(conn)
-        if conn.execute("SELECT COUNT(*) FROM portfolios").fetchone()[0] == 0:
+        if not conn.execute("SELECT 1 FROM portfolios LIMIT 1").fetchone():
             seed_portfolios(conn)
         restore_data_tasks_from_db(conn)
-        if conn.execute("SELECT COUNT(*) FROM price_observations").fetchone()[0] == 0:
+        if not conn.execute("SELECT 1 FROM price_observations LIMIT 1").fetchone():
             backfill_price_observations(conn)
-        if conn.execute("SELECT COUNT(*) FROM market_items").fetchone()[0] == 0:
+        if not conn.execute("SELECT 1 FROM market_items LIMIT 1").fetchone():
             sync_market_items_from_catalog(conn)
-        if conn.execute("SELECT COUNT(*) FROM market_item_prices").fetchone()[0] == 0:
+        if not conn.execute("SELECT 1 FROM market_item_prices LIMIT 1").fetchone():
             backfill_market_item_prices(conn)
-        cleanup_market_universe(conn)
+        # Metadata cleanup is an explicit ingestion task, not startup work.
 
 
 def put_snapshot(conn, snap, sort_key):
@@ -1354,7 +2153,6 @@ def first_name(obj, *paths):
 
 
 def fetch_json(url):
-    throttle_steam_request(url)
     req = urllib.request.Request(url, headers={
         'Accept-Encoding': 'gzip',
         'User-Agent': f'{APP_NAME}/{APP_VERSION}',
@@ -1362,12 +2160,83 @@ def fetch_json(url):
     return fetch_json_request(req, timeout=20)
 
 
-def fetch_json_request(req, timeout=60):
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+def fetch_json_request(req, timeout=60, metadata=None):
+    is_steam = urllib.parse.urlsplit(req.full_url).hostname == 'steamcommunity.com'
+    context = steam_network_open(urllib.request.build_opener(_NoRedirect()), req, timeout) if is_steam else urllib.request.build_opener(_NoSteamRedirect()).open(req, timeout=timeout)
+    with context as resp:
         body = resp.read()
         if resp.headers.get('Content-Encoding', '').lower() == 'gzip':
             body = gzip.decompress(body)
-        return json.loads(body.decode('utf-8', 'replace'))
+        value = json.loads(body.decode('utf-8', 'replace'))
+        if metadata is not None:
+            # Last-Modified describes the upstream HTTP representation. Neither
+            # HTTP Date nor our fetch clock proves when a market trade occurred.
+            modified = resp.headers.get('Last-Modified')
+            modified = modified if isinstance(modified, str) and len(modified) <= 128 else None
+            etag = resp.headers.get('ETag')
+            etag = etag if isinstance(etag, str) and len(etag) <= 512 else None
+            modified_at = None
+            if modified:
+                try:
+                    parsed = email.utils.parsedate_to_datetime(modified)
+                    if parsed.tzinfo is not None:
+                        modified_at = int(parsed.timestamp())
+                except (TypeError, ValueError, OverflowError):
+                    pass
+            metadata.update(fetchedAt=int(time.time()), upstreamLastModified=modified,
+                            upstreamSnapshotModifiedAt=modified_at, upstreamEtag=etag,
+                            contentSHA256=hashlib.sha256(body).hexdigest())
+        return value
+
+
+def save_provider_fetch_receipt(conn, provider, source, metadata, received_rows, valid_rows,
+                                observation_as_of=None, content_replayed=False):
+    """Join a successful fetch receipt to the caller's provider transaction."""
+    receipt = {
+        'version': 1, 'provider': provider, 'source': 'csgotrader:' + source,
+        'ingestionVersion': PROVIDER_SNAPSHOT_INGESTION_VERSION,
+        'contentSHA256': metadata.get('contentSHA256'),
+        'observationAsOf': observation_as_of, 'contentReplayed': bool(content_replayed),
+        'fetchedAt': metadata.get('fetchedAt'),
+        'upstreamSnapshotModifiedAt': metadata.get('upstreamSnapshotModifiedAt'),
+        'upstreamLastModified': metadata.get('upstreamLastModified'),
+        'upstreamEtag': metadata.get('upstreamEtag'),
+        'receivedRows': int(received_rows), 'validRows': int(valid_rows),
+        'fetchReceiptState': 'last_successful_fetch',
+        'upstreamTimeSemantics': 'http_representation_last_modified_not_trade_time',
+    }
+    conn.execute('''INSERT INTO settings(key,value) VALUES(?,?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value''',
+        ('provider_fetch_receipt:csgotrader:' + provider,
+         json.dumps(receipt, separators=(',', ':'))))
+    return receipt
+
+
+def provider_fetch_receipt(conn, provider):
+    row = conn.execute('SELECT value FROM settings WHERE key=?',
+                       ('provider_fetch_receipt:csgotrader:' + provider,)).fetchone()
+    try:
+        value = json.loads(row['value']) if row else None
+        return value if isinstance(value, dict) and value.get('version') == 1 else {}
+    except (ValueError, TypeError):
+        return {}
+
+
+def provider_snapshot_observation(metadata, previous, captured_at):
+    """Keep one capture clock per consecutive exact body/version, not per GET.
+
+    HTTP Last-Modified and ETag alone do not qualify replay. All source rows
+    still pass through current-state/metadata repair and derived-view checks.
+    A missing/old receipt or changed ingestion version takes the normal path.
+    """
+    digest = metadata.get('contentSHA256')
+    prior = previous.get('observationAsOf')
+    replay = (isinstance(digest, str) and re.fullmatch(r'[0-9a-f]{64}', digest) is not None
+              and previous.get('contentSHA256') == digest
+              and type(previous.get('ingestionVersion')) is int
+              and previous['ingestionVersion'] == PROVIDER_SNAPSHOT_INGESTION_VERSION
+              and type(prior) is int and 0 < prior <= captured_at)
+    return (prior, True) if replay else (captured_at, False)
 
 
 def parse_iso_ts(value):
@@ -1379,15 +2248,415 @@ def parse_iso_ts(value):
         return int(time.time())
 
 
+# Composition source: inserted into server.py, not imported as another runtime module.
+STEAM_NETWORK_SLOT = threading.Lock()
+STEAM_ASK_RECOVERY_LOCK = threading.Lock()
+STEAM_ASK_PROCESS_READY = False
+STEAM_ASK_REQUEST_CONTEXT = threading.local()
+
+
+def steam_ask_db(write=False, shared_read=False):
+    if shared_read and write:
+        raise ValueError("Shared holdings connections must be read-only")
+    # Fail before opening a database on runtimes without the required close guard.
+    no_checkpoint = getattr(sqlite3, 'SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE', None)
+    if (no_checkpoint is None or not callable(getattr(sqlite3.Connection, 'setconfig', None))
+            or not callable(getattr(sqlite3.Connection, 'getconfig', None))):
+        raise sqlite3.NotSupportedError('Steam ask storage requires verified no-checkpoint connection support')
+    conn = sqlite3.connect(Path(DB_FILE).resolve().as_uri() + ('?mode=rw' if write else '?mode=ro'),
+                           uri=True, timeout=0.1, check_same_thread=not shared_read)
+    try:
+        # These connection settings precede every database statement and transaction.
+        suppress_checkpoint = not write
+        auto_checkpoint_pages = 1000 if write else 0
+        conn.setconfig(no_checkpoint, suppress_checkpoint)
+        if conn.getconfig(no_checkpoint) is not suppress_checkpoint:
+            raise sqlite3.OperationalError('Steam ask checkpoint close policy was not verified')
+        conn.execute(f'PRAGMA wal_autocheckpoint={auto_checkpoint_pages}')
+        checkpoint_setting = conn.execute('PRAGMA wal_autocheckpoint').fetchone()
+        if not checkpoint_setting or checkpoint_setting[0] != auto_checkpoint_pages:
+            raise sqlite3.OperationalError('Steam ask automatic checkpoint policy was not verified')
+        conn.row_factory = sqlite3.Row
+        conn.execute('PRAGMA busy_timeout=100')
+        conn.execute('PRAGMA foreign_keys=ON')
+        if not write:
+            conn.execute('PRAGMA query_only=ON')
+        return conn
+    except BaseException:
+        conn.close()
+        raise
+
+
+def steam_held_rows(portfolio_id=None, include_reference_priorities=False):
+    """Only held names and bounded exact metadata; no full catalog map/raw/history."""
+    with closing(steam_ask_db()) as conn:
+        conn.execute('BEGIN')
+        if portfolio_id:
+            portfolio = conn.execute('SELECT id FROM portfolios WHERE id=?', (portfolio_id,)).fetchone()
+        else:
+            portfolio = conn.execute('SELECT id FROM portfolios ORDER BY sort_key DESC,imported_at DESC LIMIT 1').fetchone()
+        if not portfolio:
+            raise ValueError('Selected portfolio does not exist')
+        rows = [dict(row) for row in conn.execute('SELECT name,qty FROM portfolio_items WHERE portfolio_id=? ORDER BY sort_key,name LIMIT 10001', (portfolio['id'],))]
+        if len(rows) > steam_held_asks.MAX_HOLDING_ROWS:
+            raise ValueError('Portfolio exceeds the 10000-row acquisition bound')
+        names = list(dict.fromkeys(row['name'] for row in rows if isinstance(row['name'], str)))
+        candidates, native_verified, native_rejected, reference_prices = {}, set(), set(), {}
+        for start in range(0, len(names), 256):
+            chunk = names[start:start + 256]
+            marks = ','.join('?' for _ in chunk)
+            for table in ('market_items', 'item_catalog'):
+                for meta in conn.execute('SELECT name,market_hash_name,kind FROM ' + table + ' WHERE name IN (' + marks + ')', chunk):
+                    if meta['market_hash_name']:
+                        candidates.setdefault(meta['name'], []).append(dict(meta))
+            if include_reference_priorities:
+                # Existing USD-normalized reference amounts rank work only; never enter ask valuation.
+                ranks = {provider: rank for rank, provider in enumerate(PRIMARY_PRICE_PROVIDER_ORDER)}
+                providers = ','.join('?' for _ in ranks)
+                for price in conn.execute('SELECT name,provider,price,solid_price FROM market_item_prices WHERE name IN (' + marks + ') AND provider IN (' + providers + ')', chunk + list(ranks)):
+                    amount = _positive_float(price['solid_price']) or _positive_float(price['price'])
+                    if amount and math.isfinite(amount):
+                        prior = reference_prices.get(price['name'])
+                        if prior is None or ranks[price['provider']] < prior[0]:
+                            reference_prices[price['name']] = (ranks[price['provider']], amount)
+        native_tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name IN('catalog_items_v2','catalog_identifiers_v2')")}
+        if native_tables == {'catalog_items_v2', 'catalog_identifiers_v2'}:
+            # Read only indexed exact Steam identifier bindings. Never enroll/repair or infer an ID.
+            identities = list(dict.fromkeys(names + [meta['market_hash_name'] for values in candidates.values() for meta in values]))
+            for start in range(0, len(identities), 256):
+                chunk = identities[start:start + 256]
+                owners = {}
+                for item in conn.execute('''SELECT x.value,x.item_id,i.entity_type,i.priceable,i.market_hash_name
+                    FROM catalog_identifiers_v2 x LEFT JOIN catalog_items_v2 i ON i.item_id=x.item_id
+                    WHERE x.namespace='steam:730:market_hash_name' AND x.value IN(''' + ','.join('?' for _ in chunk) + ')', chunk):
+                    owners.setdefault(item['value'], []).append(dict(item))
+                for value, bindings in owners.items():
+                    if (len(bindings) == 1 and bindings[0]['entity_type'] == 'listing'
+                            and bindings[0]['priceable'] == 1 and bindings[0]['market_hash_name'] == value):
+                        native_verified.add(value)
+                    else:
+                        native_rejected.add(value)
+        holdings = []
+        for row in rows:
+            exact = {row['name']} if row['name'] in native_verified else set()
+            for meta in candidates.get(row['name'], []):
+                value = meta['market_hash_name']
+                if value in native_verified:
+                    exact.add(value)
+                elif (value not in native_rejected and meta['kind'] in CATALOG_LEGACY_KINDS
+                      and catalog_row_is_market_listing(meta)):
+                    exact.add(value)
+            issue = 'ambiguous_listing_identity' if len(exact) > 1 else 'no_verified_listing_identity' if not exact else None
+            holdings.append({'marketHashName': next(iter(exact)) if len(exact) == 1 else None, 'qty': row['qty'],
+                             'displayName': row['name'], 'identityIssue': issue,
+                             'priorityReferenceUsd': (reference_prices.get(row['name']) or (None, None))[1]})
+        return 'portfolio:' + portfolio['id'], holdings
+
+
+def steam_ask_reconcile_startup():
+    global STEAM_ASK_PROCESS_READY
+    with STEAM_ASK_RECOVERY_LOCK:
+        if STEAM_ASK_PROCESS_READY:
+            return
+        with closing(steam_ask_db(write=True)) as conn:
+            if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='steam_ask_control'").fetchone():
+                return  # No schema/ask claims before explicit enrollment.
+            steam_held_asks.AskStore(conn).reconcile_startup(int(time.time()))
+        STEAM_ASK_PROCESS_READY = True  # Failed recovery never opens the network gate.
+
+
+@contextlib.contextmanager
+def steam_ask_request_context(token):
+    if getattr(STEAM_ASK_REQUEST_CONTEXT, 'token', None) is not None:
+        raise RuntimeError('Nested Steam ask claim context is invalid')
+    STEAM_ASK_REQUEST_CONTEXT.token = token
+    try:
+        yield
+    finally:
+        STEAM_ASK_REQUEST_CONTEXT.token = None
+
+
+def steam_ask_load_cooldown():
+    steam_ask_reconcile_startup()
+    with closing(steam_ask_db()) as conn:
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='steam_ask_control'").fetchone():
+            return  # Pre-install history only. An incompatible existing schema fails closed.
+        blocked = steam_held_asks.AskStore(conn).cooldown(int(time.time()), getattr(STEAM_ASK_REQUEST_CONTEXT, 'token', None))
+    if blocked:
+        STEAM_ACCESS_GATE.honor_deadline(blocked['retryAt'], blocked.get('cooldownReason') or 'persisted_provider_cooldown')
+        raise SteamRequestCooldown(blocked)
+
+
+def steam_ask_record_429(retry_after, retry_at):
+    state = STEAM_ACCESS_GATE.note_429(retry_after, retry_at)
+    try:
+        with closing(steam_ask_db(write=True)) as conn:
+            steam_held_asks.AskStore(conn).persist_cooldown(state, int(time.time()))
+    except steam_held_asks.AskSchemaUnavailable:
+        pass
+    return state
+
+
+
+class SteamGovernorDeferred(RuntimeError):
+    def __init__(self, state):
+        self.state = dict(state)
+        super().__init__('Steam acquisition deferred by its durable request governor')
+
+
+def steam_governor_status():
+    """One saved settings lookup; missing state remains paused, with no write."""
+    with closing(steam_ask_db()) as conn:
+        return steam_request_governor.RequestGovernor(conn).status(int(time.time()))
+
+
+def steam_governor_write(method, *args, **kwargs):
+    with SQLITE_WRITE_LOCK:
+        with closing(steam_ask_db(write=True)) as conn:
+            return getattr(steam_request_governor.RequestGovernor(conn), method)(*args, **kwargs)
+
+
+def steam_governor_deferral():
+    try:
+        status = steam_governor_status()
+    except (sqlite3.Error, steam_request_governor.GovernorError):
+        return {'reason': 'governor_unavailable', 'operatorPaused': True,
+                'retryAt': None, 'recoveryRequired': True}
+    if status.get('operatorPaused'):
+        return {'reason': status.get('pauseReason') or 'operator_paused', 'operatorPaused': True,
+                'retryAt': None, 'recoveryRequired': bool(status.get('recoveryRequired'))}
+    if status.get('leasePresent'):
+        return {'reason': 'governor_inflight', 'operatorPaused': False,
+                'retryAt': None, 'recoveryRequired': bool(status.get('recoveryRequired'))}
+    due = status.get('nextAllowedAt')
+    if type(due) is int and due > int(time.time()):
+        return {'reason': 'request_budget_wait', 'operatorPaused': False, 'retryAt': due,
+                'recoveryRequired': False}
+    return None
+
+
+def steam_governor_deferred_result(name, state):
+    return dict(STEAM_CURRENT_ASK._base(name), success=False, status='governor_deferred',
+                fetchedAt=None, lowestAsk=None, cached=False, httpStatus=None,
+                error='Steam acquisition is paused or waiting for its saved request budget; no request sent.',
+                governorDeferred=True, **state)
+
+
+def steam_governor_control(data):
+    # A control POST must not wait behind a bulk transaction after its client times out.
+    # Actual reserve/finish persistence retains its separate uncertainty-safe path.
+    if not SQLITE_WRITE_LOCK.acquire(blocking=False):
+        raise sqlite3.OperationalError('CS2 writer is busy; governor control was not applied')
+    try:
+        return steam_governor_control_locked(data)
+    finally:
+        SQLITE_WRITE_LOCK.release()
+
+
+def steam_governor_control_locked(data):
+    if not isinstance(data, dict):
+        raise ValueError('One explicit Steam request-control object is required')
+    action = data.get('action')
+    if action == 'pause' and set(data) <= {'action', 'expectedRevision'}:
+        return steam_governor_write('control', 'pause', int(time.time()),
+                                    expected_revision=data.get('expectedRevision'))
+    if action != 'start_validation' or set(data) != {'action','expectedRevision','requestLimit','minimumIntervalSeconds'}:
+        raise ValueError('Only pause or one explicit bounded validation is supported')
+    # The old provider cooldown and uncertain typed lease remain independently binding.
+    with closing(steam_ask_db()) as conn:
+        blocked = steam_held_asks.AskStore(conn).cooldown(int(time.time()))
+    if blocked or STEAM_ACCESS_GATE.cooldown() or ACTIVE_DATA_TASK_ID:
+        raise ValueError('Existing provider cooldown/request lease or history task still blocks validation')
+    cash_price_capacity()
+    return steam_governor_write('control', 'start_validation', int(time.time()),
+        expected_revision=data['expectedRevision'], validation_requests=data['requestLimit'],
+        minimum_interval_seconds=data['minimumIntervalSeconds'])
+
+
+class BoundedSteamResponse:
+    """Count a response without retaining its body; bound legacy listing/history reads."""
+    def __init__(self, response):
+        self.response, self.bytes_read = response, 0
+    def __getattr__(self, name):
+        return getattr(self.response, name)
+    def read(self, size=-1):
+        remaining = 8 * 1024 * 1024 - self.bytes_read
+        wanted = remaining + 1 if size is None or size < 0 else min(size, remaining + 1)
+        value = self.response.read(wanted)
+        self.bytes_read += len(value)
+        if self.bytes_read > 8 * 1024 * 1024:
+            raise ValueError('Steam response exceeded8MiB network-body cap')
+        return value
+
+
+@contextlib.contextmanager
+def steam_network_open(opener, request, timeout):
+    # All controlled Steam collectors share this persisted reservation and HTTP lifetime.
+    with STEAM_NETWORK_SLOT:
+        steam_ask_load_cooldown()
+        if urllib.parse.urlsplit(request.full_url).path != '/market/priceoverview/':
+            with closing(steam_ask_db()) as priority_conn:
+                pending = steam_held_asks.AskStore(priority_conn).active_job()
+            if pending:
+                raise SteamGovernorDeferred({'reason':'holdings_priority','operatorPaused':False,
+                    'retryAt':None,'recoveryRequired':False})
+        cash_price_capacity()
+        claim = steam_governor_write('reserve', request.full_url, int(time.time()))
+        if claim.get('action') != 'request':
+            raise SteamGovernorDeferred({key:value for key,value in claim.items() if key != 'action'})
+        started = time.monotonic()
+        code, raw_retry, upstream, failure, counted = None, None, None, None, None
+        network_started = False
+        try:
+            STEAM_ACCESS_GATE.throttle(request.full_url)
+            admission = steam_governor_write('mark_started', claim, int(time.time()))
+            if admission.get('started') is not True:
+                raise SteamGovernorDeferred({key:value for key,value in admission.items() if key != 'action'})
+            network_started = True
+            with opener.open(request, timeout=timeout) as response:
+                code = response.status
+                if response.geturl() != request.full_url:
+                    raise ValueError('Unexpected Steam response target')
+                counted = BoundedSteamResponse(response)
+                yield counted
+        except urllib.error.HTTPError as error:
+            code = error.code
+            headers = getattr(error, 'headers', None)
+            raw = headers.get('Retry-After') if headers is not None else None
+            raw_retry = raw if isinstance(raw,str) and len(raw) <= 128 else None
+            upstream = steam_retry_after_timestamp(raw_retry, int(time.time()))
+            try:
+                if code == 429:
+                    steam_ask_record_429(raw_retry, upstream)
+            finally:
+                error.close()
+            raise
+        except BaseException as error:
+            failure = type(error).__name__ if network_started else 'cancelled_before_http'
+            raise
+        finally:
+            # The HTTP context has closed before this short durable outcome transaction.
+            steam_governor_write('finish', claim, int(time.time()), code,
+                counted.bytes_read if counted else 0, int((time.monotonic()-started)*1000),
+                retry_after=raw_retry, upstream_retry_at=upstream, transport_error=failure)
+
+
+def steam_ask_public_open(request, timeout):
+    return steam_network_open(urllib.request.build_opener(_NoRedirect()), request, timeout)
+
+
+def durable_steam_current_ask(name, claim=None):
+    name = validate_market_hash(name)
+    steam_ask_reconcile_startup()
+    now = int(time.time())
+    with closing(steam_ask_db()) as conn:
+        store = steam_held_asks.AskStore(conn)
+        cached = store.current_receipt(name)
+        if cached and 0 <= now - cached['fetchedAt'] < steam_request_governor.ASK_CACHE_SECONDS:
+            return dict(cached, expiresAt=cached['fetchedAt'] + steam_request_governor.ASK_CACHE_SECONDS)
+        negative = conn.execute("SELECT retry_at,last_error,last_status FROM steam_ask_current WHERE market_hash_name=? AND currency='USD' AND retry_at>?", (name, now)).fetchone()
+        if negative:
+            return dict(STEAM_CURRENT_ASK._base(name), success=False,
+                        status='failed' if negative['last_status'] == 'failed' else 'unavailable', cached=True,
+                        lowestAsk=None, fetchedAt=None, retryAt=negative['retry_at'], error=negative['last_error'] or 'Ask acquisition cooldown')
+    deferred = steam_governor_deferral()
+    if deferred:
+        return steam_governor_deferred_result(name, deferred)
+    single = None
+    if claim is None:
+        with closing(steam_ask_db(write=True)) as conn:
+            single = steam_held_asks.AskStore(conn).claim_single(now)
+        if single['action'] != 'request':
+            return dict(STEAM_CURRENT_ASK._base(name), success=False, status=single['action'],
+                        cached=False, lowestAsk=None, fetchedAt=None, error='Steam ask acquisition is paused.',
+                        **{key: value for key, value in single.items() if key != 'action'})
+    try:
+        with steam_ask_request_context(single['token'] if single else claim['token']):
+            result = STEAM_CURRENT_ASK.fetch(name, saved_deadline=steam_saved_retry_deadline)
+    except SteamGovernorDeferred as error:
+        result = steam_governor_deferred_result(name, error.state)
+    except SteamRequestCooldown as error:
+        result = dict(STEAM_CURRENT_ASK._base(name), success=False, status='cooldown', cached=False,
+                      lowestAsk=None, fetchedAt=None, httpStatus=None, error='Steam requests paused.', **error.state)
+    except Exception:
+        blocked = STEAM_ACCESS_GATE.cooldown()
+        result = dict(STEAM_CURRENT_ASK._base(name), success=False, status='cooldown' if blocked else 'failed', cached=False,
+                      lowestAsk=None, fetchedAt=None, error='Steam request or cooldown persistence failed; no automatic retry.',
+                      **(blocked or {}))
+    if single:
+        with closing(steam_ask_db(write=True)) as conn:
+            steam_held_asks.AskStore(conn).finish_single(single['token'], name, result, int(time.time()))
+    if result.get('success'):
+        result = dict(result, durable=bool(single))  # Worker atomically saves before publishing its progress.
+    return result
+
+
+STEAM_HELD_ASK_WORKER = steam_held_asks.AskWorker(lambda: steam_ask_db(write=True), durable_steam_current_ask,
+    before_claim=steam_ask_reconcile_startup)
+
+
+def steam_ask_value_response(portfolio_id=None, fresh_seconds=3600, summary=False):
+    scope, rows = steam_held_rows(portfolio_id)
+    with closing(steam_ask_db()) as conn:
+        conn.execute('BEGIN')
+        store = steam_held_asks.AskStore(conn)
+        value = store.valuation(rows, int(time.time()), fresh_seconds)
+        job = conn.execute('SELECT id,holdings_fingerprint,state,updated_at FROM steam_ask_jobs WHERE scope=? ORDER BY created_at DESC,id DESC LIMIT 1', (scope,)).fetchone()
+        value.update(jobId=job['id'] if job else None,
+                     jobStateAtValuation=job['state'] if job else None,
+                     jobUpdatedAtValuation=job['updated_at'] if job else None,
+                     jobHoldingsFingerprint=job['holdings_fingerprint'] if job else None,
+                     holdingsChangedSinceJob=job['holdings_fingerprint'] != value['holdingsFingerprint'] if job else None)
+    if summary:
+        value.pop('items', None)
+    return dict(value, scope=scope, summaryOnly=bool(summary))
+
+
+def steam_ask_job_response(job_id=None):
+    with closing(steam_ask_db()) as conn:
+        store = steam_held_asks.AskStore(conn)
+        job = store.job_status(job_id) if job_id else store.active_job()
+        if not job and job_id is None:
+            row = conn.execute('SELECT id FROM steam_ask_jobs ORDER BY created_at DESC,id DESC LIMIT 1').fetchone()
+            job = store.job_status(row['id']) if row else None
+        elif job:
+            job = store.job_status(job['id'])
+        cooldown = store.cooldown(int(time.time()))
+    return {'job': job, 'cooldown': cooldown, 'workerRunning': bool(STEAM_HELD_ASK_WORKER.thread and STEAM_HELD_ASK_WORKER.thread.is_alive()),
+            'workerError': STEAM_HELD_ASK_WORKER.last_error, 'source': 'steam_priceoverview', 'currency': 'USD',
+            'governor': steam_governor_status()}
+
+
+def steam_ask_job_action(data):
+    if not isinstance(data, dict):
+        raise ValueError('One job action object is required')
+    steam_ask_reconcile_startup()
+    action = data.get('action', 'start')
+    if action in ('start','resume') and steam_governor_status().get('operatorPaused', True):
+        raise ValueError('Steam acquisition is paused by the saved request governor. Saved quotes remain available.')
+    if action == 'start' and set(data) <= {'action', 'portfolioId', 'freshnessSeconds'}:
+        portfolio_id = data.get('portfolioId')
+        if portfolio_id is not None and (not isinstance(portfolio_id, str) or len(portfolio_id) > 128):
+            raise ValueError('Invalid portfolio ID')
+        scope, rows = steam_held_rows(portfolio_id, include_reference_priorities=True)
+        with closing(steam_ask_db(write=True)) as conn:
+            job = steam_held_asks.AskStore(conn).create_job(scope, rows, int(time.time()), data.get('freshnessSeconds', 3600))
+    elif action in ('resume', 'cancel') and set(data) == {'action', 'jobId'}:
+        job_id = data['jobId']
+        if not isinstance(job_id, str) or re.fullmatch(r'[0-9a-f]{32}', job_id) is None:
+            raise ValueError('Invalid job ID')
+        with closing(steam_ask_db(write=True)) as conn:
+            store = steam_held_asks.AskStore(conn)
+            job = store.resume(job_id, int(time.time())) if action == 'resume' else store.cancel(job_id, int(time.time()))
+    else:
+        raise ValueError('Unsupported job action or fields')
+    if action != 'cancel':
+        STEAM_HELD_ASK_WORKER.kick()
+    return {'job': job, 'started': action == 'start', 'currency': 'USD', 'source': 'steam_priceoverview'}
+
+
 def throttle_steam_request(url):
-    global STEAM_LAST_REQUEST_AT
-    if 'steamcommunity.com' not in str(url):
-        return
-    with STEAM_REQUEST_LOCK:
-        wait = STEAM_MIN_INTERVAL - (time.time() - STEAM_LAST_REQUEST_AT)
-        if wait > 0:
-            time.sleep(wait)
-        STEAM_LAST_REQUEST_AT = time.time()
+    STEAM_ACCESS_GATE.throttle(url)
 
 
 def catalog_stale(conn):
@@ -1398,38 +2667,151 @@ def catalog_stale(conn):
 
 
 def normalize_catalog_item(kind, obj):
-    name = obj.get('market_hash_name') or obj.get('name')
-    if not name:
+    # Existing nine kinds deliberately retain their original normalization and
+    # identifiers. New published classes require exact source identity, and an
+    # explicit market hash before they can become a priceable listing.
+    strict = kind not in CATALOG_LEGACY_KINDS
+    if strict and kind not in CATALOG_REPOSITORY_SOURCES:
+        raise ValueError('Unconfigured catalog class: ' + str(kind))
+    if strict and kind != 'tools' and not isinstance(obj.get('id'), str):
+        raise ValueError('Published catalog ID required')
+    if strict and kind != 'tools' and not obj['id'].strip():
+        raise ValueError('Nonempty published catalog ID required')
+    market_hash = obj.get('market_hash_name')
+    if strict:
+        if market_hash is not None and (not isinstance(market_hash, str) or not market_hash.strip() or any(ord(char) < 32 for char in market_hash)):
+            raise ValueError('Invalid non-null exact market_hash_name; retained last successful snapshot')
+        if obj.get('marketable') is not None and type(obj['marketable']) is not bool:
+            raise ValueError('Invalid marketable flag; retained last successful snapshot')
+        market_hash = market_hash if isinstance(market_hash, str) and market_hash.strip() else None
+        # Inventory rows describe definitions, not individual market variants.
+        # marketable=true does not establish the exact Steam listing name.
+        if kind in ('tools', 'base_weapons') or obj.get('marketable') is False:
+            market_hash = None
+    name = market_hash or obj.get('name')
+    if not isinstance(name, str) or not name.strip():
         return None
     rarity = first_name(obj, ('rarity',)) or obj.get('rarity')
     collection = first_name(obj, ('collections',), ('crates',), ('collection',))
-    return {
-        'name': name,
-        'kind': kind,
+    row = {
+        'name': name, 'kind': kind,
         'item_type': first_name(obj, ('category',), ('type',)) or obj.get('type') or kind,
-        'weapon': first_name(obj, ('weapon',)),
-        'collection': collection,
+        'weapon': first_name(obj, ('weapon',)), 'collection': collection,
         'rarity': rarity,
         'rarity_color': first_name(obj, ('rarity', 'color')) or (obj.get('rarity') or {}).get('color') if isinstance(obj.get('rarity'), dict) else None,
         'image': obj.get('image'),
-        'market_hash_name': obj.get('market_hash_name') or name,
-        'raw': json.dumps(obj, separators=(',', ':')),
+        'market_hash_name': market_hash if strict else obj.get('market_hash_name') or name,
+        'raw': json.dumps({key: value for key, value in obj.items() if key != '_catalog_inventory_key'}, separators=(',', ':')),
         'updated_at': int(time.time()),
     }
+    if strict:
+        row.update(entity_type='listing' if market_hash else 'metadata', priceable=bool(market_hash))
+    return row
+
+
+def catalog_source_batch(kind, data):
+    """Validate one source and select tools only from the inventory envelope."""
+    coverage = {}
+    if kind == 'tools':
+        if not isinstance(data, dict) or not isinstance(data.get('tools'), dict):
+            raise ValueError('Inventory tools category missing; retained last successful snapshot')
+        categories = sorted(data)
+        coverage = {'observedInventoryCategories': categories,
+                    'unmappedInventoryCategories': sorted(set(categories) - CATALOG_DOCUMENTED_INVENTORY_CATEGORIES),
+                    'selectedInventoryCategory': 'tools',
+                    'unselectedInventoryCategories': sorted(set(categories) - {'tools'})}
+        selected = []
+        for key, obj in data['tools'].items():
+            if not isinstance(key, str) or not key or not isinstance(obj, dict):
+                raise ValueError('Invalid inventory tools def_index record')
+            selected.append({**obj, '_catalog_inventory_key': key})
+        data = selected
+    elif isinstance(data, dict):
+        data = list(data.values())
+    if not isinstance(data, list) or not data:
+        raise ValueError('Catalog source missing or unexpectedly empty; retained last successful snapshot')
+    if any(not isinstance(obj, dict) for obj in data):
+        raise ValueError('Catalog source contained a non-object item')
+    return data, coverage
+
+
+def catalog_source_record(kind, obj, row):
+    raw = {key: value for key, value in obj.items() if key != '_catalog_inventory_key'}
+    metadata = {'kind': row['kind'], 'type': row['item_type'], 'weapon': row['weapon'],
+                'collection': row['collection'], 'rarity': row['rarity'],
+                'rarityColor': row['rarity_color'], 'image': row['image']}
+    record = {**row, 'external_id': obj.get('id'), 'raw': raw, 'metadata': metadata}
+    if kind not in CATALOG_LEGACY_KINDS:
+        namespace = 'bymykel:published:' + kind + ':' + row['entity_type']
+        identity_value = json.dumps([obj.get('id'), row['market_hash_name']], separators=(',', ':')) if row['priceable'] else obj.get('id')
+        record['identifiers'] = [(namespace, identity_value)]
+        metadata.update(publishedId=obj.get('id'), identityNamespace=namespace, identityValue=identity_value,
+                        identityScheme='published_id_and_exact_market_hash' if row['priceable'] else 'published_definition_id',
+                        priceabilityEvidence='explicit_market_hash_name' if row['priceable'] else 'no_verified_market_listing')
+        for key in ('def_index', 'pet_id', 'style', 'marketable'):
+            if key in obj:
+                metadata[key] = obj[key]
+        if kind == 'tools':
+            key = obj.get('_catalog_inventory_key')
+            if not isinstance(key, str) or not key:
+                raise ValueError('Inventory tools def_index identity required')
+            record['external_id'] = 'tools:' + key
+            record['identifiers'] = [('bymykel:inventory:tools:def_index', key)]
+            metadata.update(identityNamespace='bymykel:inventory:tools:def_index',
+                            identityValue=key,
+                            identityScheme='inventory_category_and_def_index',
+                            inventoryCategory='tools', inventoryKey=key)
+    return record
+
+
+def catalog_projectable_row(row):
+    # Legacy bootstrap/parity only knows the original two metadata kinds.
+    # New definitions remain addressable through the typed item ID API.
+    return row['kind'] in CATALOG_LEGACY_KINDS or catalog_row_is_market_listing(row)
+
+
+def catalog_source_coverage(store, status=None):
+    """Source snapshot coverage, not a claim of live prices or all game data."""
+    statuses = {row['source']: row for row in (status if status is not None else store.status()).get('sources', [])}
+    saved = dict(store.connection.execute("SELECT key,value FROM catalog_store_meta WHERE key LIKE 'catalog_contract_receipt:%'"))
+    result = []
+    for kind, url in CATALOG_REPOSITORY_SOURCES.items():
+        status = statuses.get('catalog:' + kind, {})
+        try:
+            receipt = json.loads(saved['catalog_contract_receipt:' + kind]) if 'catalog_contract_receipt:' + kind in saved else None
+        except (TypeError, ValueError):
+            receipt = None
+        result.append({'kind': kind, 'source': 'catalog:' + kind, 'url': url,
+                       'status': status.get('status', 'not_fetched'),
+                       'lastSuccessAt': status.get('lastSuccessAt'),
+                       'lastAttemptAt': status.get('lastAttemptAt'), 'error': status.get('error'),
+                       'lastGoodReceipt': receipt,
+                       'covered': bool(status.get('lastSuccessAt')),
+                       'receiptQualified': bool(receipt and receipt.get('sourceGeneration') == status.get('generation'))})
+    unknown = sorted({value for source in result for value in
+                      (source['lastGoodReceipt'] or {}).get('unmappedInventoryCategories', [])})
+    return {'contractVersion': CATALOG_CONTRACT_VERSION,
+            'semantics': 'configured published class snapshots; not real-time trade coverage',
+            'documentedClassCoverageConfigured': True, 'sources': result,
+            'allConfiguredSourcesHaveLastGood': all(source['covered'] for source in result),
+            'allConfiguredSourcesCurrentAttemptComplete': all(source['status'] == 'complete' for source in result),
+            'allReceiptsQualified': all(source['receiptQualified'] for source in result),
+            'unmappedInventoryCategories': unknown,
+            'unknownFutureClassesCovered': False,
+            'inventoryPolicy': 'tools only; remaining categories use their dedicated class feeds',
+            'legacyProjection': 'original nine kinds plus verified new listings; new definitions are native only'}
 
 
 def catalog_row_is_market_listing(row):
-    """Return whether a catalog identity is a direct market listing.
-
-    CSGO-API also publishes collection definitions and grouped skin families.
-    Those are useful metadata, but most are not priced Steam listings and should
-    not inflate market coverage gaps.
-    """
-    kind = (row.get('kind') if isinstance(row, dict) else row['kind']) or ''
-    if kind == 'collections':
+    """Keep legacy identities stable; require evidence for new typed classes."""
+    row = dict(row)
+    kind = row.get('kind') or ''
+    if kind in ('collections', 'skin_families'):
         return False
-    if kind == 'skin_families':
+    if row.get('priceable') is False or row.get('entity_type', row.get('entityType')) in ('metadata', 'collection', 'skin_family', 'legacy_reference'):
         return False
+    if kind in CATALOG_REPOSITORY_SOURCES and kind not in CATALOG_LEGACY_KINDS:
+        return bool(row.get('market_hash_name', row.get('marketHashName')))
     return True
 
 
@@ -1459,10 +2841,148 @@ def backfill_catalog_collections(conn):
             updates.append((collection, row['name']))
     if updates:
         conn.executemany("UPDATE item_catalog SET collection=? WHERE name=?", updates)
+        mark_catalog_source_changed(conn)
+        catalog_sync_legacy_metadata(conn, 'item_catalog', names=[name for _, name in updates])
     return len(updates)
 
 
+def refresh_catalog_repository(force=False):
+    """Publish each complete source independently; retain every failed source."""
+    global COLLECTION_CASE_ALIAS_CACHE
+    if not CATALOG_STORE_WRITES and not force:
+        return
+    now = int(time.time())
+    with db() as conn:
+        store = catalog_writer(conn)
+        receipts = {row['source']: row for row in store.status().get('sources', [])}
+    due = force or any(
+        not receipts.get('catalog:' + kind, {}).get('lastSuccessAt')
+        or now - receipts['catalog:' + kind]['lastSuccessAt'] > CATALOG_TTL
+        for kind in CATALOG_REPOSITORY_SOURCES)
+    if not due:
+        return
+    outcomes = []
+    for kind, url in CATALOG_REPOSITORY_SOURCES.items():
+        attempted_at = int(time.time())
+        try:
+            payload = fetch_json(url)
+            fetched_at = int(time.time())
+            data, coverage = catalog_source_batch(kind, payload)
+            normalized, records = [], []
+            for obj in data:
+                row = normalize_catalog_item(kind, obj)
+                if row is None:
+                    raise ValueError('Catalog source contained an item without an identity')
+                normalized.append(row)
+                records.append(catalog_source_record(kind, obj, row))
+            coverage.update(contractVersion=CATALOG_CONTRACT_VERSION, receivedRows=len(data),
+                            listingRows=sum(catalog_row_is_market_listing(row) for row in normalized),
+                            definitionRows=sum(not catalog_row_is_market_listing(row) for row in normalized),
+                            attemptedAt=attempted_at, fetchedAt=fetched_at, sourceUrl=url)
+            outcomes.append((kind, records, normalized, coverage, None))
+        except Exception as exc:
+            outcomes.append((kind, [], [], {'attemptedAt': attempted_at}, str(exc)))
+    with SQLITE_WRITE_LOCK:
+        with db() as conn:
+            store = catalog_writer(conn)
+            projected, native_published = False, False
+            projected_names = []
+            for kind, records, rows, coverage, error in outcomes:
+                try:
+                    published = store.publish_source('catalog:' + kind, records, attempted_at=coverage.get('fetchedAt', coverage['attemptedAt']),
+                                                     complete=error is None, error=error)
+                except (ValueError, catalog_store.IdentityConflict) as exc:
+                    published = store.publish_source('catalog:' + kind, [], attempted_at=coverage.get('fetchedAt', coverage['attemptedAt']),
+                                                     complete=False, error=str(exc))
+                if not published.get('ok'):
+                    continue
+                native_published = True
+                coverage['sourceGeneration'] = published['generation']
+                conn.execute('INSERT INTO catalog_store_meta(key,value) VALUES(?,?) '
+                             'ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+                             ('catalog_contract_receipt:' + kind, json.dumps(coverage, separators=(',', ':'))))
+                rows = [row for row in rows if catalog_projectable_row(row)]
+                if not rows:
+                    continue
+                # Never send new definitions through legacy listing inference.
+                conn.executemany(
+                    """INSERT INTO item_catalog
+                       (name, kind, item_type, weapon, collection, rarity, rarity_color,
+                        image, market_hash_name, raw, updated_at)
+                       VALUES (:name, :kind, :item_type, :weapon, :collection, :rarity,
+                               :rarity_color, :image, :market_hash_name, :raw, :updated_at)
+                       ON CONFLICT(name) DO UPDATE SET kind=excluded.kind,
+                         item_type=excluded.item_type, weapon=excluded.weapon,
+                         collection=excluded.collection, rarity=excluded.rarity,
+                         rarity_color=excluded.rarity_color, image=excluded.image,
+                         market_hash_name=excluded.market_hash_name, raw=excluded.raw,
+                         updated_at=excluded.updated_at""", rows)
+                projected = True
+                projected_names.extend(row['name'] for row in rows)
+            if projected:
+                backfill_catalog_collections(conn)
+                catalog_sync_legacy_metadata(conn, 'item_catalog', names=projected_names)
+                sync_market_items_from_catalog(conn)
+                COLLECTION_CASE_ALIAS_CACHE = None
+            if native_published:
+                mark_catalog_source_changed(conn)
+
+
+def catalog_payload_from_store(store):
+    by_name, identities, preferred = {}, {}, {}
+    timestamps, physical_names, canonical_names = [], set(), set()
+    for item in store.iter_compatibility_items():
+        canonical_names.add(item['name'])
+        rank = (item.get('entityType') == 'listing', item['itemId'])
+        variants = []
+        # Match the canonical projection's source preference. For a physical
+        # alias, retain that exact row's normalized fields and provenance.
+        for record in sorted(item.get('legacyMetadataRecords', []),
+                             key=lambda row: row['store'] == 'item_catalog'):
+            physical_names.add(record['name'])
+            variants.append((record['name'], record['metadata'], [{'source': record['source'],
+                'rawRef': record['rawRef'], 'updatedAt': record['updatedAt'], 'active': record['active']}]))
+        # Canonical/feed-normalized fields retain their existing precedence.
+        variants.append((item['name'], item.get('metadata') or {}, item.get('provenance', [])))
+        for name, metadata, provenance in variants:
+            identities.setdefault(name, set()).add(item['itemId'])
+            if name in preferred and preferred[name] > rank:
+                continue
+            preferred[name] = rank
+            by_name[name] = {
+                'name': name, 'kind': metadata.get('kind') or item.get('kind'),
+                'type': metadata.get('type'), 'weapon': metadata.get('weapon'),
+                'collection': metadata.get('collection'), 'rarity': metadata.get('rarity'),
+                'rarityColor': metadata.get('rarityColor'), 'image': metadata.get('image'),
+                'marketHashName': item.get('marketHashName') if item.get('entityType') == 'listing' else None,
+                'entityType': item.get('entityType'), 'priceable': bool(item.get('priceable')),
+                'provenance': provenance,
+            }
+        updated_at = (item.get('freshness') or {}).get('metadataUpdatedAt')
+        if updated_at is not None:
+            timestamps.append(int(updated_at))
+    for name, value in by_name.items():
+        candidates = sorted(identities[name])
+        value.update(itemId=candidates[0] if len(candidates) == 1 else None,
+                     itemIds=candidates, identityStatus='unique' if len(candidates) == 1 else 'ambiguous')
+        if len(candidates) > 1:
+            value.update(priceable=False, marketHashName=None)
+    status = store.status()
+    return {
+        'items': [by_name[name] for name in sorted(by_name)],
+        'updatedAt': min(timestamps) if timestamps else None,
+        'freshness': {'oldestMetadataAt': min(timestamps) if timestamps else None,
+                      'newestMetadataAt': max(timestamps) if timestamps else None},
+        'coverage': {**status, 'legacyNameCollisions': sum(len(ids) - 1 for ids in identities.values()),
+                     'physicalMetadataNamesIncluded': len(physical_names),
+                     'additionalAliasNames': len(set(by_name) - canonical_names),
+                     'publishedClasses': catalog_source_coverage(store, status)},
+    }
+
+
 def refresh_catalog(force=False):
+    if CATALOG_STORE_ENABLED:
+        return refresh_catalog_repository(force=force)
     global COLLECTION_CASE_ALIAS_CACHE
     with db() as conn:
         stale = catalog_stale(conn)
@@ -1504,18 +3024,118 @@ def refresh_catalog(force=False):
             backfill_catalog_collections(conn)
             sync_market_items_from_catalog(conn)
             cleanup_market_universe(conn)
+            mark_catalog_source_changed(conn)
             COLLECTION_CASE_ALIAS_CACHE = None
 
 
 def catalog_payload():
-    refresh_catalog(False)
-    with db() as conn:
+    if CATALOG_COMPATIBILITY_FEED_ENABLED:
+        with closing(catalog_read_db()) as conn:
+            conn.execute('BEGIN')
+            return catalog_payload_from_store(require_catalog_store(conn))
+    with closing(catalog_read_db()) as conn:
+        conn.execute('BEGIN')
         rows = conn.execute(
             """SELECT name, kind, item_type AS type, weapon, collection, rarity,
-                      rarity_color AS rarityColor, image, market_hash_name AS marketHashName
+                      rarity_color AS rarityColor, image, market_hash_name AS marketHashName,updated_at
                FROM item_catalog"""
         ).fetchall()
-    return {'items': [dict(r) for r in rows], 'updatedAt': int(time.time())}
+    items = [dict(row) for row in rows]
+    updated = max((int(row.pop('updated_at') or 0) for row in items),default=None)
+    return {'items':items,'updatedAt':updated,'dataState':'saved','cacheState':'cached' if items else 'missing',
+            'freshness':{'sourceAsOf':updated,'currentness':'saved_metadata'}}
+
+
+def catalog_market_projection(conn, row, projection_context=None):
+    """Project verified listing evidence without replacing its namesake definition.
+
+    Native registry enrollment is never attempted here. Only an existing exact
+    Steam identifier and immutable published skins evidence can resolve a legacy
+    family collision; aliases and family labels are not identity proof.
+    """
+    row = dict(row)
+    if catalog_row_is_market_listing(row):
+        return {'status': 'listing', 'row': row}
+    if row.get('kind') != 'skin_families':
+        return {'status': 'unresolved', 'reason': 'metadata_entity', 'row': None}
+
+    def unresolved(reason):
+        return {'status': 'unresolved', 'reason': reason, 'name': row.get('name'), 'row': None}
+
+    name = row.get('name')
+    try:
+        family_raw = json.loads(row.get('raw') or '{}')
+    except (TypeError, ValueError):
+        return unresolved('invalid_family_evidence')
+    if (not isinstance(family_raw, dict) or not isinstance(family_raw.get('id'), str)
+            or not family_raw['id'] or family_raw.get('market_hash_name') not in (None, name)
+            or not isinstance(name, str) or not name):
+        return unresolved('no_usable_published_family_identity')
+    if projection_context is not None:
+        if projection_context.setdefault('connection', conn) is not conn:
+            raise ValueError('Projection context belongs to another connection')
+        cached = projection_context.get('resolved', {}).get((name, family_raw['id']))
+        if cached is not None:
+            return dict(cached, row=dict(cached['row']))
+    ready = projection_context.get('registryPresent') if projection_context is not None else None
+    if ready is None:
+        required = {'catalog_identifiers_v2', 'catalog_items_v2', 'catalog_metadata_v2', 'catalog_payloads_v2'}
+        present = {value[0] for value in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN (?,?,?,?)", tuple(sorted(required)))}
+        ready = present == required
+        if projection_context is not None:
+            projection_context['registryPresent'] = ready
+    if not ready:
+        return unresolved('native_listing_registry_unavailable')
+    owners = conn.execute('''SELECT i.item_id,i.name,i.entity_type,i.priceable,i.kind,i.market_hash_name,
+        m.active,m.updated_at,
+        CASE WHEN length(CAST(m.raw_ref_json AS BLOB)) <= 8192 THEN m.raw_ref_json END AS raw_ref_json
+        FROM catalog_identifiers_v2 x
+        LEFT JOIN catalog_items_v2 i ON i.item_id=x.item_id
+        LEFT JOIN catalog_metadata_v2 m ON m.item_id=i.item_id AND m.source='catalog:skins'
+        WHERE x.namespace='steam:730:market_hash_name' AND x.value=? LIMIT 2''', (name,)).fetchall()
+    if len(owners) != 1:
+        return unresolved('missing_or_ambiguous_native_listing')
+    owner = dict(owners[0])
+    if (owner['entity_type'] != 'listing' or owner['priceable'] != 1 or owner['kind'] != 'skins'
+            or owner['name'] != name or owner['market_hash_name'] != name or owner['active'] != 1
+            or type(owner['updated_at']) is not int or owner['updated_at'] <= 0):
+        return unresolved('native_listing_identity_mismatch')
+    try:
+        reference = json.loads(owner['raw_ref_json'] or '{}')
+    except (TypeError, ValueError):
+        return unresolved('invalid_published_payload_reference')
+    payload_id = reference.get('payloadId') if isinstance(reference, dict) else None
+    if (not isinstance(reference, dict) or reference.get('storage') != 'catalog_payload'
+            or not isinstance(payload_id, str) or re.fullmatch(r'[0-9a-f]{64}', payload_id) is None):
+        return unresolved('invalid_published_payload_reference')
+    payload = conn.execute('''SELECT CASE WHEN length(CAST(data AS BLOB)) <= 131072 THEN data END AS data
+        FROM catalog_payloads_v2 WHERE payload_id=?''', (payload_id,)).fetchone()
+    if not payload or not isinstance(payload['data'], (str, bytes)):
+        return unresolved('published_payload_missing_or_oversized')
+    data = payload['data'].encode('utf-8') if isinstance(payload['data'], str) else payload['data']
+    if hashlib.sha256(data).hexdigest() != payload_id:
+        return unresolved('published_payload_hash_mismatch')
+    try:
+        published = json.loads(data)
+    except (TypeError, ValueError, UnicodeError):
+        return unresolved('invalid_published_payload')
+    if (not isinstance(published, dict) or published.get('id') != family_raw['id']
+            or published.get('market_hash_name') != name or published.get('marketable') is False):
+        return unresolved('published_listing_identity_mismatch')
+    projected = normalize_catalog_item('skins', published)
+    if not projected or projected['name'] != name or projected['market_hash_name'] != name:
+        return unresolved('published_listing_normalization_mismatch')
+    # Retain the immutable source bytes and its saved capture clock, not this read's time.
+    projected.update(raw=data.decode('utf-8'), updated_at=owner['updated_at'])
+    proof = {'status': 'resolved', 'itemId': owner['item_id'], 'source': 'catalog:skins',
+             'publishedId': published['id'], 'payloadId': payload_id,
+             'marketHashName': name, 'definitionRetained': True}
+    projected['_marketProjection'] = proof
+    result = dict(proof, row=projected)
+    if projection_context is not None:
+        projection_context.setdefault('resolved', {})[(name, family_raw['id'])] = result
+    return result
 
 
 def sync_market_items_from_catalog(conn):
@@ -1528,9 +3148,13 @@ def sync_market_items_from_catalog(conn):
     if not rows:
         return 0
     payload = []
+    projection_context = {'connection': conn}
     for r in rows:
         if not catalog_row_is_market_listing(r):
-            continue
+            projection = catalog_market_projection(conn, r, projection_context)
+            if projection['row'] is None:
+                continue
+            r = projection['row']
         payload.append({
             'name': r.get('name'),
             'market_hash_name': r.get('market_hash_name') or r.get('name'),
@@ -1564,6 +3188,9 @@ def sync_market_items_from_catalog(conn):
              updated_at=excluded.updated_at""",
         payload,
     )
+    if payload:
+        mark_catalog_source_changed(conn)
+    catalog_sync_legacy_metadata(conn, 'market_items', records=payload)
     return len(payload)
 
 
@@ -1574,7 +3201,9 @@ def infer_market_meta_from_name(name):
         return {}
     meta = {'name': name, 'market_hash_name': name}
     event = event_from_name(name)
-    if name.startswith('★') or re.search(r'\b(knife|gloves|wraps)\b', name, re.I):
+    if name.startswith('Sticker Slab | '):
+        meta.update({'kind': 'stickers', 'item_type': 'Sticker Slab', 'collection': event, 'rarity': 'Sticker'})
+    elif name.startswith('★') or re.search(r'\b(knife|gloves|wraps)\b', name, re.I):
         meta.update({'kind': 'skins', 'item_type': 'Knives', 'weapon': base_item_name(name), 'rarity': 'Covert'})
     elif (
         ' capsule' in low or ' package' in low or ' case' in low or
@@ -1617,6 +3246,7 @@ def repair_market_item_metadata(conn, limit=None):
         params.append(int(limit))
     rows = conn.execute(q, params).fetchall()
     updated = 0
+    updated_names = []
     for row in rows:
         meta = infer_market_meta_from_name(row['name'])
         if not meta.get('kind') and not meta.get('item_type'):
@@ -1643,6 +3273,10 @@ def repair_market_item_metadata(conn, limit=None):
             ),
         )
         updated += 1
+        updated_names.append(row['name'])
+    if updated_names:
+        mark_catalog_source_changed(conn)
+        catalog_sync_legacy_metadata(conn, 'market_items', names=updated_names)
     return updated
 
 
@@ -1661,6 +3295,8 @@ def cleanup_market_universe(conn):
              )"""
     )
     result['removed'] = cur.rowcount if cur.rowcount is not None else 0
+    if result['removed']:
+        mark_market_source_changed(conn)
     return result
 
 
@@ -1675,14 +3311,60 @@ def catalog_meta_for_name(conn, name):
            LIMIT 1""",
         (name, name, name),
     ).fetchone()
-    return dict(row) if row else None
+    if row is None:
+        return None
+    row = dict(row)
+    if catalog_row_is_market_listing(row):
+        return row
+    projection = catalog_market_projection(conn, row)
+    return projection['row'] if projection['row'] is not None else {**row, '_marketProjection': projection}
 
 
-def ensure_market_item(conn, name, meta=None):
+def ensure_market_item(conn, name, meta=None, metadata_memo=None, track_metadata=False):
     if not name:
         return None
-    meta = meta or catalog_meta_for_name(conn, name) or infer_market_meta_from_name(name) or {}
+    reconcile_raw = meta is not None
+    memo = None
+    if metadata_memo is not None:
+        if metadata_memo.get('connection') is not conn:
+            raise ValueError('metadata memo belongs to another writer connection')
+        track_metadata = track_metadata or metadata_memo.get('trackMetadataChanges', False)
+        memo = metadata_memo['names']
+        if not conn.in_transaction:
+            memo.clear()
+        if meta is None and name in memo:
+            return memo[name]
+        memo.pop(name, None)
+    if not meta:
+        meta = catalog_meta_for_name(conn, name)
+        if not meta:
+            meta = infer_market_meta_from_name(name) or {}
+            if name.startswith('Sticker Slab | '):
+                existing_slab = conn.execute('SELECT market_hash_name FROM market_items WHERE name=?', (name,)).fetchone()
+                if existing_slab or has_published_catalog_identity(conn, name):
+                    # Quoted reads/ensures do not prove existing metadata was
+                    # inferred. Only the guarded discovery path repairs it.
+                    meta = {'name': name, 'market_hash_name':
+                            (existing_slab['market_hash_name'] if existing_slab else None) or name}
+    if not catalog_row_is_market_listing(meta):
+        projection = meta.get('_marketProjection') or catalog_market_projection(conn, meta)
+        if projection.get('row') is None:
+            # A quote may retain its exact incoming name, but cannot overwrite a
+            # listing with definition fields or manufacture listing metadata.
+            if metadata_memo is not None:
+                metadata_memo.setdefault('catalogProjectionUnresolved', {})[name] = {
+                    key: value for key, value in projection.items() if key != 'row'}
+            if memo is not None:
+                memo[name] = name
+            return name
+        meta = projection['row']
     canonical = meta.get('name') or name
+    metadata_fields = ('market_hash_name', 'kind', 'item_type', 'weapon', 'collection',
+                       'rarity', 'rarity_color', 'image')
+    previous = None
+    if track_metadata and metadata_memo is not None:
+        previous = conn.execute('SELECT ' + ','.join(metadata_fields) +
+                                ' FROM market_items WHERE name=?', (canonical,)).fetchone()
     now = int(time.time())
     conn.execute(
         """INSERT INTO market_items
@@ -1716,8 +3398,88 @@ def ensure_market_item(conn, name, meta=None):
         ),
     )
     if canonical != name:
-        ensure_market_item(conn, name, {'name': name, 'market_hash_name': name})
+        ensure_market_item(conn, name, {'name': name, 'market_hash_name': name},
+                           metadata_memo=metadata_memo, track_metadata=track_metadata)
+    catalog_sync_legacy_metadata(conn, 'market_items', names=[canonical], reconcile_raw=reconcile_raw)
+    if track_metadata and metadata_memo is not None:
+        incoming = {**meta, 'market_hash_name': meta.get('market_hash_name') or name}
+        if previous is None or any(incoming.get(key) is not None and previous[key] != incoming[key]
+                                   for key in metadata_fields):
+            metadata_memo.setdefault('catalogChangedNames', set()).add(canonical)
+            if previous is None:
+                metadata_memo.setdefault('catalogNewNames', set()).add(canonical)
+    if memo is not None:
+        memo[name] = canonical
+        memo[canonical] = canonical
     return canonical
+
+
+def provider_listing_name_is_usable(name):
+    """Reject localization tokens and malformed keys, without inventing a price."""
+    return (isinstance(name, str) and bool(name) and name == name.strip()
+            and not name.startswith('#') and not any(ord(char) < 32 or ord(char) == 127 for char in name))
+
+
+def has_published_catalog_identity(conn, name):
+    if not CATALOG_STORE_ENABLED:
+        return False
+    # Resolve trusted evidence through a published ID/alias, rather than infer
+    # identity or overwrite a source record merely because its name matches.
+    return conn.execute('''SELECT 1 FROM catalog_aliases_v2 a
+        JOIN catalog_metadata_v2 m ON m.item_id=a.item_id
+        WHERE a.value=? AND a.namespace IN ('name','steam:730:market_hash_name')
+          AND (m.source LIKE 'catalog:%' OR m.source IN ('legacy:item_catalog','manual'))
+        LIMIT 1''', (name,)).fetchone() is not None
+
+
+def discover_unpriced_market_item(conn, name, metadata_memo):
+    """Admit exact known metadata or verified public-feed name families only."""
+    discoveries = metadata_memo.setdefault('unpricedDiscoveries', {})
+    if name in discoveries:
+        return discoveries[name]
+    if not provider_listing_name_is_usable(name):
+        return 'rejected_name'
+    meta = catalog_meta_for_name(conn, name)
+    if meta:
+        if not catalog_row_is_market_listing(meta):
+            result = 'metadata_entity'
+        else:
+            ensure_market_item(conn, name, meta, metadata_memo=metadata_memo, track_metadata=True)
+            result = 'known_metadata'
+    else:
+        existing = conn.execute('''SELECT market_hash_name,kind,item_type,weapon,collection,rarity,
+            raw IS NOT NULL AS raw_present,image IS NOT NULL AS image_present,
+            rarity_color IS NOT NULL AS rarity_color_present FROM market_items WHERE name=?''', (name,)).fetchone()
+        recognized = next((prefix for prefix in ('Sticker Slab | ', 'Sticker | ', 'Sealed Graffiti | ')
+                           if name.startswith(prefix) and all(part.strip() for part in name.split(' | '))), None)
+        if not recognized:
+            result = 'known_existing' if existing else 'unverified_name'
+        elif has_published_catalog_identity(conn, name):
+            result = 'published_identity_preserved'
+        elif existing and recognized == 'Sticker Slab | ':
+            inferred_agent = (existing['kind'] == 'agents' and existing['item_type'] == 'Agent'
+                and existing['rarity'] == 'Agent' and existing['market_hash_name'] == name
+                and existing['weapon'] == name.rsplit(' | ', 1)[-1]
+                and existing['collection'] == event_from_name(name)
+                and not existing['raw_present'] and not existing['image_present']
+                and not existing['rarity_color_present'])
+            if inferred_agent:
+                # The old generic agent inference populated this exact field.
+                # Clear it only under the old-inference fingerprint above.
+                conn.execute('UPDATE market_items SET weapon=NULL WHERE name=?', (name,))
+                ensure_market_item(conn, name, infer_market_meta_from_name(name),
+                                   metadata_memo=metadata_memo, track_metadata=True)
+                result = 'inferred_slab_repaired'
+            else:
+                result = 'existing_metadata_preserved'
+        elif existing:
+            result = 'known_existing'
+        else:
+            ensure_market_item(conn, name, infer_market_meta_from_name(name),
+                               metadata_memo=metadata_memo, track_metadata=True)
+            result = 'recognized_name'
+    discoveries[name] = result
+    return result
 
 
 def provider_key_from_source(source=None, provider=None, quote=None):
@@ -1929,18 +3691,143 @@ def recalculate_market_item_primary(conn, name):
     return chosen
 
 
-def upsert_market_item_price(conn, quote, provider=None, source=None, recalculate=True):
+def catalog_validate_quote_binding_receipt(receipt, scope):
+    """Validate compact saved provenance before it can short-circuit reconciliation."""
+    bad = catalog_store.IdentityConflict
+    if (not isinstance(receipt, dict) or type(receipt.get('contractVersion')) is not int
+            or receipt['contractVersion'] != 1 or receipt.get('scope') != scope
+            or receipt.get('provider') != scope[0] or receipt.get('source') != scope[1]
+            or receipt.get('exactProviderName') != scope[2]):
+        raise bad('Invalid native quote binding receipt scope or version')
+    capture = receipt.get('capturedAt')
+    raw_sha = receipt.get('quoteRawSHA256')
+    reported_hash = receipt.get('reportedMarketHashName')
+    if (type(capture) is not int or capture <= 0
+            or type(receipt.get('recordedAt')) is not int or receipt['recordedAt'] <= 0
+            or not isinstance(raw_sha, str) or re.fullmatch(r'[0-9a-f]{64}', raw_sha) is None
+            or receipt.get('legacyObservationKey') != [scope[2], scope[0], observation_bucket(capture)]
+            or (reported_hash is not None and (not isinstance(reported_hash, str) or not reported_hash))
+            or receipt.get('currentWriteDisposition') not in (
+                'upserted_current', 'retained_newer_current', 'retained_unchanged_current')):
+        raise bad('Invalid native quote binding receipt capture or provenance')
+    state = receipt.get('status')
+    bindings = receipt.get('legacyStreamBindings')
+    pending_count = receipt.get('pendingLegacyStreamCount')
+    if not isinstance(bindings, dict) or type(pending_count) is not int:
+        raise bad('Invalid native quote binding stream status')
+    if state == 'unresolved':
+        if (receipt.get('identityStatus') != 'unresolved_definition' or receipt.get('itemId') is not None
+                or bindings or pending_count != 0 or not isinstance(receipt.get('reason'), str)
+                or not receipt['reason']):
+            raise bad('Invalid unresolved native quote binding receipt')
+    elif state in ('legacy_stream_binding_pending', 'resolved'):
+        if (receipt.get('identityStatus') != 'verified_listing' or not isinstance(receipt.get('itemId'), str)
+                or not receipt['itemId'] or set(bindings) != {'market_item_prices', 'price_observations'}
+                or any(value not in ('bound', 'pending') for value in bindings.values())
+                or pending_count != sum(value == 'pending' for value in bindings.values())
+                or (state == 'resolved' and (pending_count != 0 or receipt.get('reason') is not None))
+                or (state == 'legacy_stream_binding_pending' and (
+                    pending_count == 0 or receipt.get('reason') != 'legacy_reference_requires_verified_decision'))):
+            raise bad('Invalid qualified native quote binding receipt')
+    else:
+        raise bad('Unknown native quote binding receipt status')
+    return receipt
+
+
+def catalog_record_quote_binding(conn, record, quote, issue, item_id, disposition, metadata_memo=None,
+                                 binding_states=None):
+    """One bounded issue per exact provider/source/name, with identity and link states separate."""
+    scope = [record['provider'], record['source'], record['name']]
+    encoded_scope = json.dumps(scope, ensure_ascii=False, separators=(',', ':'))
+    key = 'catalog_native_binding_issue:v1:' + hashlib.sha256(encoded_scope.encode('utf-8')).hexdigest()
+    saved = conn.execute('SELECT value FROM catalog_store_meta WHERE key=?', (key,)).fetchone()
+    previous = catalog_validate_quote_binding_receipt(json.loads(saved['value']), scope) if saved else None
+    bindings = dict(binding_states or {})
+    if issue is None:
+        if (not item_id or set(bindings) != {'market_item_prices', 'price_observations'}
+                or any(value not in ('bound', 'pending') for value in bindings.values())):
+            raise ValueError('Verified identity and both explicit legacy stream results required')
+    elif issue.get('status') != 'unresolved_definition' or item_id is not None or bindings:
+        raise ValueError('Explicit unresolved definition result required')
+    if issue is None and previous is None:
+        return None  # Ordinary qualified quotes retain the core's existing pending-link contract.
+    captured_at = record['updated_at']
+    if type(captured_at) is not int or captured_at <= 0:
+        raise ValueError('Binding provenance requires the original valid quote capture')
+    raw = record.get('raw') or ''
+    raw_bytes = raw.encode('utf-8') if isinstance(raw, str) else bytes(raw)
+    pending_count = sum(value == 'pending' for value in bindings.values())
+    state = 'unresolved' if issue is not None else ('legacy_stream_binding_pending' if pending_count else 'resolved')
+    receipt = dict(previous or {}, contractVersion=1, scope=scope, status=state,
+                   identityStatus='unresolved_definition' if issue is not None else 'verified_listing',
+                   legacyStreamBindings=bindings, pendingLegacyStreamCount=pending_count,
+                   exactProviderName=record['name'], provider=record['provider'], source=record['source'],
+                   itemId=item_id, currentWriteDisposition=disposition,
+                   identitySemantics='provider quote name retained; no definition-to-listing promotion')
+    if previous is None or captured_at >= previous['capturedAt']:
+        receipt.update(capturedAt=captured_at, quoteRawSHA256=hashlib.sha256(raw_bytes).hexdigest(),
+                       reportedMarketHashName=quote.get('marketHashName') or None,
+                       legacyObservationKey=[record['name'], record['provider'], observation_bucket(captured_at)])
+    if issue is not None:
+        receipt.update(reason=issue.get('reason') or 'unresolved_definition',
+                       metadataKind=issue.get('metadataKind'), metadataName=issue.get('metadataName'))
+    else:
+        prior_reason = (previous or {}).get('previousUnresolvedReason')
+        if previous and previous['status'] == 'unresolved':
+            prior_reason = previous['reason']
+        receipt.update(reason='legacy_reference_requires_verified_decision' if pending_count else None,
+                       previousUnresolvedReason=prior_reason)
+    comparable = {key: value for key, value in receipt.items() if key != 'recordedAt'}
+    previous_comparable = {key: value for key, value in (previous or {}).items() if key != 'recordedAt'}
+    changed = comparable != previous_comparable
+    if changed:
+        receipt['recordedAt'] = int(time.time())  # Local bookkeeping, never market time.
+        catalog_validate_quote_binding_receipt(receipt, scope)
+        serialized = json.dumps(receipt, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+        if len(serialized.encode('utf-8')) > 4096:
+            raise ValueError('Native quote binding provenance exceeds its compact 4KiB bound')
+        conn.execute('INSERT INTO catalog_store_meta(key,value) VALUES(?,?) '
+                     'ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, serialized))
+    if metadata_memo is not None:
+        if issue is not None:
+            metadata_memo.setdefault('nativeBindingUnresolvedReceipts', set()).add(key)
+        elif pending_count:
+            metadata_memo.setdefault('nativeBindingPendingReceipts', set()).add(key)
+        elif previous and previous['status'] != 'resolved':
+            metadata_memo.setdefault('nativeBindingResolvedReceipts', set()).add(key)
+    return {'key': key, 'status': receipt['status'], 'changed': changed,
+            'identityStatus': receipt['identityStatus'], 'pendingLegacyStreamCount': pending_count}
+
+
+def upsert_market_item_price(conn, quote, provider=None, source=None, recalculate=True, metadata_memo=None):
     record = market_price_record_from_quote(quote, provider=provider, source=source)
     if not record:
         return False
-    name = ensure_market_item(conn, record['name'])
+    if CATALOG_STORE_ENABLED:
+        catalog_writer(conn)
+    name = ensure_market_item(conn, record['name'], metadata_memo=metadata_memo)
     if name != record['name']:
         record['name'] = name
+    binding_issue, item_id, binding_states = None, None, {}
+    if CATALOG_STORE_ENABLED:
+        resolution = {}
+        store, item_id = catalog_identity_for_legacy(
+            conn, record['name'], market_hash_name=quote.get('marketHashName') or record['name'],
+            source=record['source'], unresolved_definition=resolution,
+        )
+        if item_id is None:
+            binding_issue = resolution
+        else:
+            binding_states['market_item_prices'] = store.bind_legacy_or_defer(item_id, 'market_item_prices', record['name'], provider=record['provider'])['status']
+            binding_states['price_observations'] = store.bind_legacy_or_defer(item_id, 'price_observations', record['name'], provider=record['provider'])['status']
     existing = conn.execute(
         "SELECT updated_at FROM market_item_prices WHERE name=? AND provider=?",
         (record['name'], record['provider']),
     ).fetchone()
     if existing and int(existing['updated_at'] or 0) > int(record['updated_at'] or 0):
+        if CATALOG_STORE_ENABLED:
+            catalog_record_quote_binding(conn, record, quote, binding_issue, item_id,
+                                         'retained_newer_current', metadata_memo, binding_states=binding_states)
         return False
     conn.execute(
         """INSERT OR REPLACE INTO market_item_prices
@@ -1977,10 +3864,14 @@ def upsert_market_item_price(conn, quote, provider=None, source=None, recalculat
         conn.execute(f"UPDATE market_items SET {', '.join(fields)} WHERE name=?", values)
     if recalculate:
         recalculate_market_item_primary(conn, record['name'])
+    if CATALOG_STORE_ENABLED:
+        catalog_record_quote_binding(conn, record, quote, binding_issue, item_id,
+                                     'upserted_current', metadata_memo, binding_states=binding_states)
+    mark_market_source_changed(conn)
     return True
 
 
-def remove_missing_provider_current_prices(conn, provider, valid_names):
+def remove_missing_provider_current_prices(conn, provider, valid_names, as_of=None):
     """Remove provider rows absent from a successful full snapshot pull.
 
     Provider snapshots are the current market view. Historical observations are
@@ -2001,16 +3892,18 @@ def remove_missing_provider_current_prices(conn, provider, valid_names):
     stale_names = [
         r['name'] for r in conn.execute(
             """SELECT name FROM market_item_prices
-               WHERE provider=? AND name NOT IN (SELECT name FROM provider_current_keep)""",
-            (provider,),
+               WHERE provider=? AND name NOT IN (SELECT name FROM provider_current_keep)
+                 AND (? IS NULL OR COALESCE(updated_at,0)<=?)""",
+            (provider, as_of, as_of),
         )
     ]
     if not stale_names:
         return 0
     conn.execute(
         """DELETE FROM market_item_prices
-           WHERE provider=? AND name NOT IN (SELECT name FROM provider_current_keep)""",
-        (provider,),
+           WHERE provider=? AND name NOT IN (SELECT name FROM provider_current_keep)
+             AND (? IS NULL OR COALESCE(updated_at,0)<=?)""",
+        (provider, as_of, as_of),
     )
     column = MARKET_ITEM_PROVIDER_COLUMNS.get(provider)
     if column:
@@ -2026,11 +3919,33 @@ def remove_missing_provider_current_prices(conn, provider, valid_names):
     return len(stale_names)
 
 
+def csgotrader_steam_aggregate_basis(raw):
+    """Recognize the saved aggregate selector without treating it as an ask."""
+    basis = raw.get('chosen_basis') if isinstance(raw, dict) else None
+    return basis if isinstance(basis, str) and basis in (
+        'last_24h_confirmed_by_rolling', 'last_7d_rolling_anchor',
+        'rolling_median_anchor', 'last_24h_only') else None
+
+
 def market_price_row_to_quote(row):
     if not row:
         return {}
     row = dict(row)
-    return {
+    basis = row.get('basis')
+    steam_aggregate = row.get('provider') == 'steam_snapshot'
+    if steam_aggregate and basis in (None, '', 'provider_snapshot'):
+        # Existing snapshots retained the selector in compact raw evidence.
+        # This read only exposes provenance; it never rewrites the saved quote.
+        raw = row.get('raw')
+        if isinstance(raw, str) and len(raw) <= 65536:
+            try:
+                evidence = json.loads(raw)
+            except (TypeError, ValueError):
+                evidence = None
+            if (isinstance(evidence, dict) and evidence.get('source') == 'csgotrader'
+                    and evidence.get('market') == 'steam'):
+                basis = csgotrader_steam_aggregate_basis(evidence.get('raw')) or basis
+    quote = {
         'name': row.get('name'),
         'provider': row.get('provider'),
         'price': row.get('price'),
@@ -2039,7 +3954,7 @@ def market_price_row_to_quote(row):
         'url': row.get('url'),
         'updated_at': row.get('updated_at'),
         'source': row.get('source') or row.get('provider'),
-        'priceBasis': row.get('basis'),
+        'priceBasis': basis,
         'priceKind': row.get('kind'),
         'confidencePct': row.get('confidence_pct'),
         'lowestSellOrder': row.get('lowest_sell_order'),
@@ -2048,6 +3963,10 @@ def market_price_row_to_quote(row):
         'orderBookSpreadPct': row.get('spread_pct'),
         'priceStabilityPct': row.get('stability_pct'),
     }
+    if steam_aggregate:
+        quote.update(priceSemantics='aggregate_reference', executableAsk=False,
+                     lowestAskState='saved' if _positive_float(row.get('lowest_sell_order')) else 'unavailable')
+    return quote
 
 
 def best_market_quotes(conn, names):
@@ -2157,10 +4076,20 @@ def save_price_observation(conn, quote, source='steam_quote', observed_at=None, 
     raw = quote.get('raw')
     if not raw:
         raw = json.dumps({'source': source}, separators=(',', ':'))
+    changes_before = conn.total_changes
     conn.execute(
-        """INSERT OR REPLACE INTO price_observations
+        """INSERT INTO price_observations
            (name, provider, observed_at, price, median, volume, source, raw, updated_at)
-           VALUES (:name, :provider, :observed_at, :price, :median, :volume, :source, :raw, :updated_at)""",
+           VALUES (:name, :provider, :observed_at, :price, :median, :volume, :source, :raw, :updated_at)
+           ON CONFLICT(name, provider, observed_at) DO UPDATE SET
+               price=excluded.price, median=excluded.median, volume=excluded.volume,
+               source=excluded.source, raw=excluded.raw, updated_at=excluded.updated_at
+           WHERE price_observations.price IS NOT excluded.price
+              OR price_observations.median IS NOT excluded.median
+              OR price_observations.volume IS NOT excluded.volume
+              OR price_observations.source IS NOT excluded.source
+              OR price_observations.raw IS NOT excluded.raw
+              OR price_observations.updated_at IS NOT excluded.updated_at""",
         {
             'name': quote.get('name'),
             'provider': provider,
@@ -2173,6 +4102,8 @@ def save_price_observation(conn, quote, source='steam_quote', observed_at=None, 
             'updated_at': int(quote.get('updated_at') or time.time()),
         },
     )
+    if conn.total_changes != changes_before:
+        mark_market_source_changed(conn)
     return True
 
 
@@ -2209,8 +4140,20 @@ def steam_cookie_header():
     return cookie or None
 
 
+def steam_saved_retry_deadline():
+    """Read one existing provider deadline; never initialize, repair, or write data."""
+    with closing(catalog_read_db()) as conn:
+        conn.execute('PRAGMA busy_timeout=50')
+        row = conn.execute("SELECT value FROM settings WHERE key='steam_history_retry_after' AND length(value)<=2048").fetchone()
+        if not row:
+            return None
+        value = json.loads(row['value'])
+        deadline = value.get('retryAt') if isinstance(value, dict) else None
+        return deadline if type(deadline) is int else None
+
+
 def steam_url_opener():
-    return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+    return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()), _NoRedirect())
 
 
 def parse_steam_history_time(raw_time):
@@ -2307,171 +4250,173 @@ def parse_steam_price_points(raw_rows):
 
 def parse_steam_ssr_price_points(page, market_hash_name):
     """Extract raw Steam chart history from the modern SSR market listing page."""
-    marker = 'window.SSR.renderContext=JSON.parse('
-    pos = page.find(marker)
-    if pos < 0:
+    if not isinstance(page, str) or len(page) > 8 * 1024 * 1024:
         return []
-    raw = page[pos + len(marker):]
+    render_ctx = None
+    modern_container = False
+    # Steam's canonical G-ID listing pages now publish the same exact-item
+    # query cache in a JSON script instead of a window assignment.
+    for attrs, content in re.findall(r'<script\b([^>]*)>(.*?)</script>', page, re.S | re.I):
+        if not re.search(r'\bid\s*=\s*["\x27]valve-ssr-data["\x27]', attrs, re.I):
+            continue
+        if not re.search(r'\btype\s*=\s*["\x27]application/json["\x27]', attrs, re.I):
+            continue
+        try:
+            root = json.loads(content)
+            render_ctx = root.get('renderContext') if isinstance(root, dict) else None
+            modern_container = True
+        except (ValueError, TypeError):
+            return []
+        break
+    if render_ctx is None:
+        marker = re.search(r'window\.SSR\.renderContext\s*=\s*JSON\.parse\s*\(', page)
+        if not marker:
+            return []
+        try:
+            encoded, _idx = json.JSONDecoder().raw_decode(page[marker.end():])
+            render_ctx = json.loads(encoded)
+        except (ValueError, TypeError):
+            return []
     try:
-        render_json, _idx = json.JSONDecoder().raw_decode(raw)
-        render_ctx = json.loads(render_json)
-        query_data = json.loads(render_ctx.get('queryData') or '{}')
-    except Exception:
+        if not isinstance(render_ctx, dict):
+            return []
+        query_data = render_ctx.get('queryData') or {}
+        if isinstance(query_data, str):
+            query_data = json.loads(query_data)
+        if not isinstance(query_data, dict):
+            return []
+    except (ValueError, TypeError):
         return []
-    fallback_prices = []
     for query in query_data.get('queries') or []:
+        if not isinstance(query, dict):
+            continue
         key = query.get('queryKey') or []
         if (
             len(key) >= 4
             and key[0] == 'market'
             and key[1] == 'pricehistory'
             and str(key[2]) == str(APPID)
+            and str(key[3]) == str(market_hash_name)
         ):
             data = (query.get('state') or {}).get('data') or {}
-            points = parse_steam_price_points(data.get('prices') or [])
-            if str(key[3]) == str(market_hash_name):
-                return points
-            if points and not fallback_prices:
-                fallback_prices = points
-    return fallback_prices
+            if not isinstance(data, dict):
+                continue
+            # Modern SSR explicitly identifies its currency. Never record a
+            # localized chart as USD merely because the page is public.
+            if modern_container and data.get('ecurrency') not in (1, '1'):
+                continue
+            return parse_steam_price_points(data.get('prices') or [])
+    # An embedded chart for a different listing is never evidence for this item.
+    return []
+
+
+def steam_retry_after_timestamp(value, now=None):
+    """Honor an explicit upstream delta/date; never invent a retry delay."""
+    now = int(time.time() if now is None else now)
+    if not isinstance(value, str) or len(value) > 128:
+        return None
+    value = value.strip()
+    if value.isascii() and value.isdigit():
+        return now + int(value)
+    try:
+        parsed = email.utils.parsedate_to_datetime(value)
+        if parsed.tzinfo is not None:
+            return max(now, int(parsed.timestamp()))
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return None
+
+
+def steam_history_rate_limit_response(error, market_hash_name, display_name):
+    if isinstance(error, SteamGovernorDeferred):
+        state = dict(error.state)
+        status = state.pop('httpStatus', None)
+        return dict(name=display_name, marketHashName=market_hash_name, provider='steam', success=False,
+            points=[], url=steam_market_url(market_hash_name), updated_at=int(time.time()),
+            error=('Steam returned a canonical market address; its next request waits for the shared saved pacing deadline.' if state.get('canonicalRedirect') else 'Steam history acquisition deferred by its saved request governor; no request sent'),
+            governorDeferred=True, rateLimited=False, httpStatus=status, cooldownActive=True, **state)
+    if isinstance(error, SteamRequestCooldown):
+        return {'name': display_name, 'marketHashName': market_hash_name,
+                'provider': 'steam', 'success': False, 'points': [],
+                'url': steam_market_url(market_hash_name), 'updated_at': int(time.time()),
+                'error': 'Steam chart refresh paused by the shared provider cooldown; no request sent',
+                'rateLimited': True, 'httpStatus': None, 'cooldownActive': True, **error.state}
+    if getattr(error, 'code', None) != 429:
+        return None
+    now = int(time.time())
+    headers = getattr(error, 'headers', None)
+    retry_after = headers.get('Retry-After') if headers is not None else None
+    retry_after = retry_after if isinstance(retry_after, str) and len(retry_after) <= 128 else None
+    retry_at = steam_retry_after_timestamp(retry_after, now)
+    steam_ask_record_429(retry_after, retry_at)
+    try:
+        error.close()
+    except Exception:
+        pass
+    return {'name': display_name, 'marketHashName': market_hash_name,
+            'provider': 'steam', 'success': False, 'points': [],
+            'url': steam_market_url(market_hash_name), 'updated_at': now,
+            'error': 'Steam rate limited chart history (HTTP429); stopped this batch' +
+                     ('; Retry-After: ' + retry_after if retry_at is not None else ''),
+            'rateLimited': True, 'httpStatus': 429, 'retryAfter': retry_after,
+            'retryAt': retry_at, 'cooldownActive': False}
 
 
 def fetch_steam_history(market_hash_name, display_name=None):
-    """
-    Pull Steam Community Market chart data for one CS2 item.
+    """Use one existing eligible method; no automatic second endpoint request.
 
-    The JSON endpoint can return HTTP 400 without a valid Steam session cookie,
-    so this function tries both:
-      1) /market/pricehistory/ JSON endpoint
-      2) the public market listing page and its embedded var line1 chart data
-
-    Set STEAM_COOKIE for the most reliable endpoint behavior:
-      export STEAM_COOKIE='steamLoginSecure=...; sessionid=...'
+    Anonymous acquisition uses the public listing chart. An already configured
+    history session uses JSON. Missing/failed charts remain explicit and saved
+    history stays available; this avoids hidden multi-request fallback demand.
     """
     market_hash_name = (market_hash_name or display_name or '').strip()
     display_name = (display_name or market_hash_name).strip()
-    if not market_hash_name:
-        return {
-            'name': display_name,
-            'marketHashName': market_hash_name,
-            'provider': 'steam',
-            'success': False,
-            'error': 'Missing market_hash_name',
-            'url': '',
-            'points': [],
-            'updated_at': int(time.time()),
-        }
-
     listing_url = steam_market_url(market_hash_name)
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36',
-        'Accept': 'application/json,text/html,text/plain,*/*',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Referer': listing_url,
-    }
+    base = dict(name=display_name, marketHashName=market_hash_name, provider='steam',
+                success=False, url=listing_url, points=[], updated_at=int(time.time()),
+                automaticFallbackRequests=False)
+    if not market_hash_name:
+        return dict(base, error='Missing market_hash_name')
+    headers = {'User-Agent':'CS2-Dash/SteamHistory',
+               'Accept':'application/json,text/html,text/plain,*/*',
+               'Accept-Language':'en-US,en;q=0.9','Referer':listing_url}
     cookie = steam_cookie_header()
     if cookie:
         headers['Cookie'] = cookie
-
-    errors = []
-    opener = steam_url_opener()
-
-    def fetch_listing_page():
-        throttle_steam_request(listing_url)
-        req = urllib.request.Request(listing_url, headers=headers)
-        with opener.open(req, timeout=STEAM_HISTORY_FETCH_TIMEOUT) as resp:
-            return resp.read().decode('utf-8', 'replace')
-
-    def parse_listing_page(page):
-        m = re.search(r'var\s+line1\s*=\s*(\[.*\]);', page, re.S)
-        if not m:
-            m = re.search(r'line1\s*=\s*(\[.*\]);', page, re.S)
-        if m:
-            raw_rows = json.loads(html.unescape(m.group(1)))
-            points = parse_steam_price_points(raw_rows)
-            if points:
-                return points, 'listing_page'
-        points = parse_steam_ssr_price_points(page, market_hash_name)
-        if points:
-            return points, 'listing_ssr'
-        return [], None
-
-    def listing_result():
-        page = fetch_listing_page()
-        points, source = parse_listing_page(page)
-        if points:
-            return {
-                'name': display_name,
-                'marketHashName': market_hash_name,
-                'provider': 'steam',
-                'success': True,
-                'source': source,
-                'url': listing_url,
-                'points': points,
-                'updated_at': int(time.time()),
-            }
-        errors.append('Steam listing page did not contain chart rows')
-        return None
-
-    # Public listing SSR is usually enough and avoids the authenticated JSON
-    # endpoint when no Steam session cookie is configured.
-    if not cookie:
-        try:
-            result = listing_result()
-            if result:
-                return result
-        except Exception as exc:
-            errors.append('Listing fallback failed: ' + str(exc))
-
-    # Try Steam's JSON endpoint. It is most complete when STEAM_COOKIE is set.
-    history_url = 'https://steamcommunity.com/market/pricehistory/?' + urllib.parse.urlencode({
-        'appid': APPID,
-        'currency': 1,
-        'country': 'US',
-        'market_hash_name': market_hash_name,
-    })
+        method = 'pricehistory'
+        url = 'https://steamcommunity.com/market/pricehistory/?' + urllib.parse.urlencode(
+            {'appid':APPID,'currency':1,'country':'US','market_hash_name':market_hash_name})
+    else:
+        method, url = 'listing_page', listing_url
+    base['acquisitionMethod'] = method
     try:
-        throttle_steam_request(history_url)
-        req = urllib.request.Request(history_url, headers=headers)
-        with opener.open(req, timeout=STEAM_HISTORY_FETCH_TIMEOUT) as resp:
-            raw = json.loads(resp.read().decode('utf-8', 'replace'))
-        points = parse_steam_price_points(raw.get('prices') or [])
+        request = urllib.request.Request(url,headers=headers)
+        with steam_network_open(steam_url_opener(),request,timeout=STEAM_HISTORY_FETCH_TIMEOUT) as response:
+            body = response.read().decode('utf-8','replace')
+        if method == 'pricehistory':
+            value = json.loads(body)
+            points = parse_steam_price_points(value.get('prices') or [])
+            source = 'pricehistory'
+        else:
+            match = re.search(r'var\s+line1\s*=\s*(\[.*\]);',body,re.S)
+            if not match:
+                match = re.search(r'line1\s*=\s*(\[.*\]);',body,re.S)
+            points = parse_steam_price_points(json.loads(html.unescape(match.group(1)))) if match else []
+            source = 'listing_page'
+            if not points:
+                points = parse_steam_ssr_price_points(body,market_hash_name)
+                source = 'listing_ssr'
         if points:
-            return {
-                'name': display_name,
-                'marketHashName': market_hash_name,
-                'provider': 'steam',
-                'success': True,
-                'url': listing_url,
-                'points': points,
-                'raw': raw,
-                'updated_at': int(time.time()),
-            }
-        errors.append(raw.get('message') or raw.get('error') or 'Steam JSON endpoint returned no prices')
-    except Exception as exc:
-        errors.append(str(exc))
-
-    if cookie:
-        try:
-            result = listing_result()
-            if result:
-                return result
-        except Exception as exc:
-            errors.append('Listing fallback failed: ' + str(exc))
-
-    return {
-        'name': display_name,
-        'marketHashName': market_hash_name,
-        'provider': 'steam',
-        'success': False,
-        'error': concise_steam_fetch_error(errors),
-        'url': listing_url,
-        'points': [],
-        'updated_at': int(time.time()),
-    }
+            return dict(base,success=True,source=source,points=points,updated_at=int(time.time()))
+        return dict(base,error='The selected Steam history method returned no chart rows; no second endpoint was requested.')
+    except Exception as error:
+        deferred = steam_history_rate_limit_response(error,market_hash_name,display_name)
+        if deferred:
+            return dict(deferred,acquisitionMethod=method,automaticFallbackRequests=False)
+        return dict(base,error='The selected Steam history method failed ('+type(error).__name__+'); saved history is retained and no automatic fallback request was sent.')
 
 
-def get_price_history(name, force=False, market_hash_name=None, rebuild_metrics=True):
+def get_price_history(name, force=False, market_hash_name=None, rebuild_metrics=True, _refresh_state=None):
     """Return locally cached Steam chart history for a single item.
 
     Network refreshes are explicit (`force=1`) so item graphs remain usable on
@@ -2484,36 +4429,90 @@ def get_price_history(name, force=False, market_hash_name=None, rebuild_metrics=
 
     now = int(time.time())
     steam_error = None
+    save_error = None
+    save_warning = None
     history_saved = False
-    with db() as conn:
-        newest = conn.execute(
-            "SELECT MAX(updated_at) AS updated_at, COUNT(*) AS n, MAX(point_ts) AS max_ts FROM price_history WHERE name=? AND provider='steam'",
-            (name,),
-        ).fetchone()
-        stale = bool(
-            newest
-            and newest['n']
-            and not newest['max_ts']
-        )
-
-        if force or stale:
-            hist = fetch_steam_history(market_hash_name or name, display_name=name)
+    rate_limit = {}
+    refresh_state = _refresh_state if _refresh_state is not None else ({} if force and rebuild_metrics else None)
+    with (db() if force else closing(catalog_read_db())) as conn:
+        if not force:
+            conn.execute('BEGIN')
+        if force:
+            if CATALOG_STORE_ENABLED:
+                # Fail before fetching if the approved catalog writer is not
+                # ready. Never silently fall back to lossy daily-only saves.
+                catalog_writer(conn)
+            # One indexed settings lookup honors an explicit Retry-After even
+            # after restart. Explicit force never bypasses this provider deadline.
+            saved_limit = conn.execute("SELECT value FROM settings WHERE key='steam_history_retry_after'").fetchone()
+            try:
+                saved_limit = json.loads(saved_limit['value']) if saved_limit else {}
+            except (TypeError, ValueError):
+                saved_limit = {}
+            retry_at = saved_limit.get('retryAt') if isinstance(saved_limit, dict) else None
+            if isinstance(retry_at, int) and not isinstance(retry_at, bool) and retry_at > now:
+                hist = {'points': [], 'error': 'Steam chart refresh paused until its Retry-After deadline',
+                        'rateLimited': True, 'httpStatus': 429, 'retryAt': retry_at,
+                        'retryAfter': saved_limit.get('retryAfter'), 'cooldownActive': True}
+            else:
+                hist = fetch_steam_history(market_hash_name or name, display_name=name)
+            if hist.get('rateLimited') or hist.get('governorDeferred'):
+                rate_limit = {key: hist.get(key) for key in
+                              ('rateLimited','httpStatus','retryAt','retryAfter','cooldownActive','governorDeferred','reason','operatorPaused','recoveryRequired','canonicalRedirect','networkAttempted')}
+                # No default cooldown is invented when Retry-After is absent or invalid.
+                if not hist.get('cooldownActive') and hist.get('retryAt') is not None:
+                    with SQLITE_WRITE_LOCK:
+                        conn.execute("INSERT INTO settings(key,value) VALUES('steam_history_retry_after',?) "
+                                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                                     (json.dumps(rate_limit, separators=(',', ':')),))
+                        conn.commit()
             if hist.get('points'):
                 try:
                     with SQLITE_WRITE_LOCK:
+                        conn.execute('BEGIN IMMEDIATE')
+                        begin_history_refresh_write(conn, refresh_state)
+                        if CATALOG_STORE_ENABLED:
+                            store, item_id = catalog_identity_for_legacy(
+                                conn, name, market_hash_name=market_hash_name or name,
+                                source='steam_history',
+                            )
+                            store.bind_legacy_or_defer(item_id, 'price_history', name, provider='steam')
+                            store.save_steam_points(
+                                item_id, hist['points'], fetched_at=hist['updated_at'],
+                                provider='steam', source=hist.get('source') or 'steam_history',
+                                grain='unknown',
+                            )
                         conn.executemany(
-                            """INSERT OR REPLACE INTO price_history
+                            """INSERT INTO price_history
                                (name, provider, point_time, point_ts, raw_time, price, volume, updated_at)
-                               VALUES (?, 'steam', ?, ?, ?, ?, ?, ?)""",
+                               VALUES (?, 'steam', ?, ?, ?, ?, ?, ?)
+                               ON CONFLICT(name, provider, point_time) DO UPDATE SET
+                                   point_ts=excluded.point_ts, raw_time=excluded.raw_time,
+                                   price=excluded.price, volume=excluded.volume, updated_at=excluded.updated_at
+                               WHERE price_history.point_ts IS NOT excluded.point_ts
+                                  OR price_history.raw_time IS NOT excluded.raw_time
+                                  OR price_history.price IS NOT excluded.price
+                                  OR price_history.volume IS NOT excluded.volume
+                                  OR price_history.updated_at IS NOT excluded.updated_at""",
                             [(name, p['time'], p.get('ts'), p.get('rawTime'), p.get('price'), p.get('volume'), hist['updated_at']) for p in hist['points']],
                         )
+                        mark_market_source_changed(conn)
+                        finish_history_refresh_write(conn, refresh_state)
                         conn.commit()
-                    save_history_quote(name, market_hash_name or name, hist['points'], hist['updated_at'])
-                    history_saved = True
+                        history_saved = True
+                        if refresh_state is not None:
+                            refresh_state.setdefault('names', set()).update([name, market_hash_name or name])
+                    save_history_quote(name, market_hash_name or name, hist['points'], hist['updated_at'],
+                                       _refresh_state=refresh_state)
                 except sqlite3.OperationalError as exc:
-                    if 'locked' not in str(exc).lower():
+                    if CATALOG_STORE_ENABLED or 'locked' not in str(exc).lower():
                         raise
-            elif force and (not newest or not newest['n']):
+                    if history_saved:
+                        save_warning = 'Steam history saved, but its reference quote could not be saved: ' + str(exc)
+                    else:
+                        conn.rollback()
+                        save_error = 'Steam history refresh could not be saved: ' + str(exc)
+            else:
                 steam_error = hist.get('error') or 'Steam returned no price-history rows. Try setting STEAM_COOKIE.'
 
         rows = conn.execute(
@@ -2526,18 +4525,21 @@ def get_price_history(name, force=False, market_hash_name=None, rebuild_metrics=
 
     point_rows = [dict(r) for r in rows]
     if history_saved and rebuild_metrics:
-        rebuild_metrics_for_names([name, market_hash_name or name])
+        rebuild_metrics_for_names([name, market_hash_name or name], refresh_state=refresh_state)
 
-    if rows:
-        with db() as conn:
-            has_quote = conn.execute(
-                "SELECT 1 FROM market_item_prices WHERE name=? AND provider='steam_history'",
-                (name,),
-            ).fetchone()
-        if not has_quote:
-            save_history_quote(name, market_hash_name or name, [dict(r) for r in rows], max((int(r['updated_at']) for r in rows), default=now))
-    elif not point_rows:
+    refresh_result = {'refreshAttempted': bool(force) and (bool(rate_limit.get('networkAttempted')) or not rate_limit.get('cooldownActive')),
+                      'historySaved': history_saved, **rate_limit}
+    if force:
+        refresh_result['lastAttemptAt'] = now
+    if steam_error or save_error:
+        refresh_result['refreshError'] = steam_error or save_error
         if steam_error:
+            refresh_result['steamError'] = steam_error
+    if save_warning:
+        refresh_result['refreshWarning'] = save_warning
+
+    if not point_rows:
+        if steam_error or save_error:
             return {
                 'provider': 'steam',
                 'currency': 'USD',
@@ -2545,10 +4547,12 @@ def get_price_history(name, force=False, market_hash_name=None, rebuild_metrics=
                 'url': steam_market_url(market_hash_name or name),
                 'marketHashName': market_hash_name or name,
                 'success': False,
-                'error': steam_error,
+                'error': steam_error or save_error,
                 'source': 'steam_history',
                 'points': [],
-                'updatedAt': now,
+                'updatedAt': None,
+                'dataState':'saved','cacheState':'missing','rebuildRequired':True,
+                **refresh_result,
             }
         return {
             'provider': 'steam',
@@ -2560,7 +4564,8 @@ def get_price_history(name, force=False, market_hash_name=None, rebuild_metrics=
             'source': 'steam_history',
             'points': [],
             'error': 'No raw Steam chart history is cached for this item.',
-            'updatedAt': now,
+            'updatedAt': None,'dataState':'saved','cacheState':'missing','rebuildRequired':True,
+            **refresh_result,
         }
 
     metrics = volatility_metrics_from_rows(point_rows)
@@ -2584,6 +4589,10 @@ def get_price_history(name, force=False, market_hash_name=None, rebuild_metrics=
         'edgeCaseSales': metrics.get('edgeCaseSales') or [],
         'edgeCaseCount': metrics.get('edgeCaseCount') or 0,
         'updatedAt': max((int(r['updated_at']) for r in rows), default=now),
+        'dataState':'saved','cacheState':'cached','rebuildRequired':False,
+        'freshness':{'sourceAsOf':max((int(r['updated_at']) for r in rows),default=None),
+                     'currentness':'saved_history','timestampRepairNeeded':any(r['ts'] is None for r in rows)},
+        **refresh_result,
     }
 
 def pct(v):
@@ -2603,6 +4612,256 @@ def parse_int_param(value, default, allowed=None, minimum=None, maximum=None):
     if maximum is not None:
         v = min(maximum, v)
     return v
+
+
+class LegacyBulkCapacityDeferred(RuntimeError):
+    pass
+
+
+def legacy_bulk_capacity_admission():
+    """Reserve space before the older reference writer; current cash is independent.
+
+    The last measured normal legacy transaction extended its WAL by about2.01GB.
+    A2GiB admission reserve exceeds that observation but is not a universal peak
+    guarantee. No writer is killed, rolled back or interrupted by this check.
+    """
+    floor = 10 * 1024 ** 3
+    reserve = 2 * 1024 ** 3
+    volume = Path(DB_FILE).resolve().anchor
+    try:
+        free = shutil.disk_usage(volume).free
+    except OSError as error:
+        raise LegacyBulkCapacityDeferred('Legacy reference refresh deferred: free space could not be verified; saved reads and current cash remain available') from error
+    if free < floor + reserve:
+        raise LegacyBulkCapacityDeferred('Legacy reference refresh deferred: requires10GiB free floor plus2GiB write reserve; saved reads and current cash remain available')
+
+
+def cash_price_capacity():
+    """Admission only: application storage retains the reviewed 10 GiB floor."""
+    floor = 10 * 1024 ** 3
+    for volume in {str(Path(DATA_DIR).resolve())}:
+        try:
+            free = shutil.disk_usage(volume).free
+        except OSError as error:
+            raise cash_prices.CashError('Cash acquisition capacity could not be verified') from error
+        if free < floor:
+            raise cash_prices.CashError('Cash acquisition paused: 10 GiB free-space floor on ' + volume)
+
+
+def cash_price_transport(exact_hashes):
+    # Import only on the worker's explicit invocation; the bridge has no import I/O.
+    from skinport_cash_transport import fetch_skinport_cash
+    return fetch_skinport_cash(exact_hashes)
+
+
+def cash_held_rows(portfolio_id, conn=None):
+    """Same exact bounded identity policy as Steam; no provider/AskStore access."""
+    if conn is None:
+        with closing(steam_ask_db()) as opened:
+            opened.execute('BEGIN')
+            return cash_held_rows(portfolio_id, opened)
+    if portfolio_id:
+        portfolio = conn.execute('SELECT id FROM portfolios WHERE id=?', (portfolio_id,)).fetchone()
+    else:
+        portfolio = conn.execute('SELECT id FROM portfolios ORDER BY sort_key DESC,imported_at DESC LIMIT 1').fetchone()
+    if not portfolio:
+        raise cash_prices.CashNotFound('Selected portfolio does not exist')
+    rows = [dict(row) for row in conn.execute('SELECT * FROM portfolio_items WHERE portfolio_id=? ORDER BY sort_key LIMIT 10001', (portfolio['id'],))]
+    if len(rows) > steam_held_asks.MAX_HOLDING_ROWS:
+        raise ValueError('Portfolio exceeds the 10000-row acquisition bound')
+    names = list(dict.fromkeys(row['name'] for row in rows if isinstance(row['name'], str)))
+    candidates, native_verified, native_rejected = {}, set(), set()
+    for start in range(0, len(names), 256):
+        chunk = names[start:start + 256]
+        marks = ','.join('?' for _ in chunk)
+        for table in ('market_items', 'item_catalog'):
+            for meta in conn.execute('SELECT name,market_hash_name,kind FROM ' + table + ' WHERE name IN (' + marks + ')', chunk):
+                if meta['market_hash_name']:
+                    candidates.setdefault(meta['name'], []).append(dict(meta))
+    native_tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name IN('catalog_items_v2','catalog_identifiers_v2')")}
+    if native_tables == {'catalog_items_v2', 'catalog_identifiers_v2'}:
+        # Read only indexed exact Steam identifier bindings. Never enroll/repair or infer an ID.
+        identities = list(dict.fromkeys(names + [meta['market_hash_name'] for values in candidates.values() for meta in values]))
+        for start in range(0, len(identities), 256):
+            chunk = identities[start:start + 256]
+            owners = {}
+            for item in conn.execute('''SELECT x.value,x.item_id,i.entity_type,i.priceable,i.market_hash_name
+                FROM catalog_identifiers_v2 x LEFT JOIN catalog_items_v2 i ON i.item_id=x.item_id
+                WHERE x.namespace='steam:730:market_hash_name' AND x.value IN(''' + ','.join('?' for _ in chunk) + ')', chunk):
+                owners.setdefault(item['value'], []).append(dict(item))
+            for value, bindings in owners.items():
+                if (len(bindings) == 1 and bindings[0]['entity_type'] == 'listing'
+                        and bindings[0]['priceable'] == 1 and bindings[0]['market_hash_name'] == value):
+                    native_verified.add(value)
+                else:
+                    native_rejected.add(value)
+    holdings = []
+    for row in rows:
+        exact = {row['name']} if row['name'] in native_verified else set()
+        for meta in candidates.get(row['name'], []):
+            value = meta['market_hash_name']
+            if value in native_verified:
+                exact.add(value)
+            elif (value not in native_rejected and meta['kind'] in CATALOG_LEGACY_KINDS
+                  and catalog_row_is_market_listing(meta)):
+                exact.add(value)
+        issue = 'ambiguous_listing_identity' if len(exact) > 1 else 'no_verified_listing_identity' if not exact else None
+        holdings.append({'marketHashName': next(iter(exact)) if len(exact) == 1 else None, 'qty': row['qty'],
+                         'displayName': row['name'], 'identityIssue': issue,
+                         'priorityReferenceUsd': None})
+    display_data = portfolio_data_from_rows(rows)
+    return 'portfolio:' + portfolio['id'], holdings, [[item[ITEM_IDX['n']], item[ITEM_IDX['q']]] for item in display_data['items']]
+
+
+def catalog_bind_cash_outcome(conn, name, meaningful_observation_at=None):
+    """Bind the already-saved exact cash row; never rewrite it as a generic quote.
+
+    The caller owns the short cash batch transaction and its source revision.
+    NULL current rows explicitly mirror unavailable cash outcomes. Historical
+    stream ownership stays intact, including the core's pending-link contract.
+    """
+    if not CATALOG_STORE_ENABLED:
+        return None
+    if not conn.in_transaction:
+        raise RuntimeError('Cash binding requires the existing outcome transaction')
+    catalog_writer(conn)  # Enforces the existing independent writer gate.
+    provider, source = cash_prices.PROVIDER, cash_prices.SOURCE
+    row = conn.execute('SELECT * FROM market_item_prices WHERE name=? AND provider=?',
+                       (name, provider)).fetchone()
+    if row is None:
+        raise ValueError('Cash binding requires its saved exact current row')
+    raw = cash_prices._saved_raw(row)
+    captured = row['updated_at']
+    amount = row['price']
+    if (row['source'] != source or row['basis'] != cash_prices.BASIS
+            or row['kind'] != 'cash_listing_reference' or row['observed_at'] != captured
+            or row['solid_price'] != amount or row['lowest_sell_order'] != amount
+            or any(row[key] is not None for key in (
+                'median', 'highest_buy_order', 'spread_pct', 'stability_pct',
+                'confidence_pct', 'volume', 'url'))
+            or raw.get('providerTimeSemantics') != 'upstream_updated_at_not_claimed_trade_time'):
+        raise ValueError('Cash binding requires the dedicated cash row contract')
+    observation_at = None
+    if meaningful_observation_at is not None:
+        if type(meaningful_observation_at) is not int or meaningful_observation_at != captured:
+            raise ValueError('Cash history uses the exact capture second, never a generic bucket')
+        observation = conn.execute('''SELECT name,price,raw,updated_at,observed_at,source
+            FROM price_observations WHERE name=? AND provider=? AND observed_at=?''',
+            (name, provider, captured)).fetchone()
+        if observation is None:
+            raise ValueError('Meaningful cash history must exist before its binding')
+        observed_raw = cash_prices._saved_raw(observation)
+        if (observation['source'] != source or observation['updated_at'] != captured
+                or observed_raw['bodySHA256'] != raw['bodySHA256']
+                or cash_prices._semantic(observed_raw) != cash_prices._semantic(raw)):
+            raise ValueError('Meaningful cash history does not match the saved outcome')
+        # A same-second same-body retry may retain its earlier microsecond raw.
+        # This is an actual legacy key, not a claim that both raw strings match.
+        observation_at = captured
+    resolution, bindings = {}, {}
+    identity_store, item_id = catalog_identity_for_legacy(
+        conn, name, market_hash_name=name, source=source, unresolved_definition=resolution)
+    if item_id is None:
+        if resolution.get('status') != 'unresolved_definition':
+            raise ValueError('Cash identity requires an explicit unresolved result')
+        identity_status, status = 'unresolved_definition', 'unresolved'
+        reason = resolution.get('reason') or 'unresolved_definition'
+    else:
+        identity = conn.execute('''SELECT entity_type,priceable,market_hash_name
+            FROM catalog_items_v2 WHERE item_id=?''', (item_id,)).fetchone()
+        if (identity is None or identity['entity_type'] != 'listing' or identity['priceable'] != 1
+                or identity['market_hash_name'] != name):
+            raise catalog_store.IdentityConflict('Cash binding must retain the exact selected listing hash')
+        for legacy_store in ('market_item_prices', 'price_observations'):
+            bindings[legacy_store] = identity_store.bind_legacy_or_defer(
+                item_id, legacy_store, name, provider=provider)['status']
+        if any(value not in ('bound', 'pending') for value in bindings.values()):
+            raise ValueError('Cash binding requires explicit bound or pending stream states')
+        identity_status = 'verified_listing'
+        status = 'legacy_stream_binding_pending' if 'pending' in bindings.values() else 'resolved'
+        reason = 'legacy_reference_requires_verified_decision' if 'pending' in bindings.values() else None
+    scope = [provider, source, name]
+    key = 'catalog_cash_binding:v1:' + hashlib.sha256(
+        json.dumps(scope, ensure_ascii=False, separators=(',', ':')).encode('utf-8')).hexdigest()
+    evidence = {
+        'contractVersion': 1, 'status': status, 'reason': reason,
+        'identityStatus': identity_status, 'itemId': item_id,
+        'marketHashName': name,
+        'provider': provider, 'source': source, 'currency': cash_prices.CURRENCY,
+        'basis': cash_prices.BASIS, 'cashState': raw['state'], 'cashReason': raw.get('reason'),
+        'capturedAt': captured, 'receivedAtUs': raw['receivedAtUs'],
+        'providerUpdatedAt': raw.get('providerUpdatedAt'),
+        'providerTimeSemantics': raw['providerTimeSemantics'],
+        'bodySHA256': raw['bodySHA256'],
+        'quoteRawSHA256': hashlib.sha256(row['raw'].encode('utf-8')).hexdigest(),
+        'currentStore': 'market_item_prices', 'currentWriteDisposition': 'upserted_current',
+        'currentValueDisposition': 'priced' if raw['state'] == 'priced' else 'explicit_unavailable',
+        'legacyStreamBindings': bindings,
+        'pendingLegacyStreamCount': sum(value == 'pending' for value in bindings.values()),
+        'historyStore': 'price_observations', 'meaningfulObservedAt': observation_at,
+        'historyDisposition': 'meaningful_outcome_recorded' if observation_at is not None else 'unchanged_outcome_no_history',
+        'identitySemantics': 'exact selected hash retained; no definition-to-listing promotion',
+    }
+    encoded = json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False)
+    if len(encoded.encode('utf-8')) > 4096:
+        raise ValueError('Cash binding evidence exceeded its compact 4KiB bound')
+    conn.execute('INSERT INTO catalog_store_meta(key,value) VALUES(?,?) '
+                 'ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, encoded))
+    return {'key': key, 'status': status, 'cashState': raw['state'], 'itemId': item_id}
+
+
+def cash_price_service():
+    global CASH_PRICE_SERVICE, CASH_PRICE_HOLDINGS_CACHE
+    BULK_STAGING_RUNTIME.require_bulk_mode()
+    with CASH_PRICE_SERVICE_LOCK:
+        if CASH_PRICE_SERVICE is None:
+            # The controller performs an offline exact quote/control handoff.
+            # Never create a store, replay DDL or reset a cooldown on a GET.
+            path = Path(DATA_DIR) / 'cash-current-v1.sqlite'
+            cache = holdings_cache.HoldingsCache(lambda: steam_ask_db(shared_read=True), cash_held_rows)
+            def saved_holdings(portfolio_id, ignored=None):
+                if portfolio_id is None:
+                    return cash_held_rows(None, None)
+                try:
+                    return cache.read(portfolio_id)
+                except holdings_cache.HoldingsCacheError as error:
+                    # Preserve the original explicit missing-scope/input response after cleanup.
+                    if isinstance(error.__cause__, (cash_prices.CashNotFound, ValueError)):
+                        raise error.__cause__
+                    raise cash_prices.CashError('Saved holdings identity is temporarily unavailable') from error
+            try:
+                service = compact_cash_service.CompactCash(
+                    path, saved_holdings, cash_price_transport, cash_price_capacity)
+            except BaseException:
+                cache.close()
+                raise
+            CASH_PRICE_HOLDINGS_CACHE = cache
+            CASH_PRICE_SERVICE = service
+        return CASH_PRICE_SERVICE
+
+
+def cash_holdings_identity_revision():
+    cash_price_service()
+    try:
+        return CASH_PRICE_HOLDINGS_CACHE.identity_revision()
+    except holdings_cache.HoldingsCacheError as error:
+        raise cash_prices.CashError('Saved holdings identity is temporarily unavailable') from error
+
+
+CANONICAL_CASH_SERVICE = None
+CANONICAL_CASH_SERVICE_LOCK = threading.Lock()
+
+
+def canonical_cash_service():
+    global CANONICAL_CASH_SERVICE
+    with CANONICAL_CASH_SERVICE_LOCK:
+        if CANONICAL_CASH_SERVICE is None:
+            service = cash_price_service()
+            CANONICAL_CASH_SERVICE = canonical_cash.CanonicalCash(service.connect, service)
+        return CANONICAL_CASH_SERVICE
+
+
+CASH_PRICE_CADENCE = cash_cadence.CashCadence(cash_price_service)
 
 
 def latest_portfolio(conn, portfolio_id=None):
@@ -2902,8 +5161,29 @@ def csgotrader_window_anchor_rows(conn, name, window_days, current_price=None, c
 
 
 def rebuild_market_metrics(conn, window_days=90, names=None):
-    """Materialize provider-consistent movement metrics from local cached rows."""
+    """Compatibility entry point for one complete or explicitly scoped window."""
     window_days = parse_int_param(window_days, 90, allowed=VOLATILITY_WINDOWS)
+    return rebuild_market_metric_windows(conn, (window_days,), names=names)[window_days]
+
+
+def rebuild_market_metric_windows(conn, windows=VOLATILITY_DETAIL_WINDOWS, names=None, as_of=None):
+    """Read each name's overlapping inputs once; keep window statistics separate.
+
+    The caller owns the transaction. No commit, history truncation or global
+    history cache is introduced. A common cutoff clock defines this rebuild.
+    """
+    windows = tuple(dict.fromkeys(parse_int_param(w, 90, allowed=VOLATILITY_WINDOWS) for w in windows))
+    if not windows:
+        return {}
+    if preserve_recovered_research_without_inputs(conn):
+        return {window: conn.execute(
+            "SELECT COUNT(*) FROM item_market_metrics WHERE provider='market' AND window_days=?",
+            (window,)).fetchone()[0] for window in windows}
+    flush_market_source_revision(conn)
+    as_of = int(time.time()) if as_of is None else int(as_of)
+    cutoffs = {w: as_of - w * 86400 if w else 0 for w in windows}
+    bounds = {w: max(0, cutoff - OBSERVATION_BUCKET_SECONDS) if cutoff else None
+              for w, cutoff in cutoffs.items()}
     clean_names = [(n or '').strip() for n in (names or []) if (n or '').strip()]
     name_filter = ''
     params = list(CURRENT_PRICE_PROVIDERS)
@@ -2911,153 +5191,220 @@ def rebuild_market_metrics(conn, window_days=90, names=None):
         marks = ','.join('?' for _ in clean_names)
         name_filter = f" AND name IN ({marks})"
         params.extend(clean_names)
+    for window in windows:
+        conn.execute("DELETE FROM item_market_metrics WHERE provider='market' AND window_days=?" + name_filter,
+                     [window] + clean_names)
     provider_marks = ','.join('?' for _ in CURRENT_PRICE_PROVIDERS)
-    if clean_names:
-        marks = ','.join('?' for _ in clean_names)
-        conn.execute(
-            f"DELETE FROM item_market_metrics WHERE provider='market' AND window_days=? AND name IN ({marks})",
-            [window_days] + clean_names,
-        )
-    else:
-        conn.execute(
-            "DELETE FROM item_market_metrics WHERE provider='market' AND window_days=?",
-            (window_days,),
-        )
-    latest_rows = [dict(r) for r in conn.execute(
+    by_name = {}
+    for result in conn.execute(
         f"""SELECT name, provider, price, solid_price, updated_at, source
             FROM market_item_prices
             WHERE provider IN ({provider_marks}) AND price IS NOT NULL{name_filter}
-            ORDER BY name, updated_at""",
-        params,
-    )]
-    by_name = {}
-    for row in latest_rows:
+            ORDER BY name, updated_at""", params):
+        row = dict(result)
         bucket = by_name.setdefault(row['name'], {})
         existing = bucket.get(row['provider'])
         if existing is None or int(row.get('updated_at') or 0) >= int(existing.get('updated_at') or 0):
             bucket[row['provider']] = row
-    cutoff = history_cutoff_ts(window_days)
-    rebuilt = 0
+
+    def read_series(name, selected_windows, provider=None):
+        # Eligibility stays in SQLite: do not replace affinity/NULL semantics
+        # with Python numeric comparisons on legacy timestamp values.
+        timestamp = 'point_ts' if provider is None else 'observed_at'
+        flags, flag_params = [], []
+        for index, window in enumerate(selected_windows):
+            bound = bounds[window]
+            if bound is None:
+                flags.append(f'1 AS eligible_{index}')
+            else:
+                expression = timestamp if bound > 0 else f'COALESCE({timestamp},0)'
+                flags.append(f'({expression} >= ?) AS eligible_{index}')
+                flag_params.append(bound)
+        widest = None if any(bounds[w] is None for w in selected_windows) else min(bounds[w] for w in selected_windows)
+        where = ''
+        tail_params = [name] if provider is None else [name, provider]
+        if widest is not None:
+            expression = timestamp if widest > 0 else f'COALESCE({timestamp},0)'
+            where = f' AND {expression} >= ?'
+            tail_params.append(widest)
+        if provider is None:
+            sql = f"""SELECT name, point_ts, price, volume, 'steam_history' AS source,
+                       'steam_history' AS provider, {', '.join(flags)}
+                       FROM price_history WHERE provider='steam' AND name=? AND price IS NOT NULL {where}
+                       ORDER BY point_ts"""
+        else:
+            sql = f"""SELECT name, observed_at AS point_ts, price, volume,
+                       COALESCE(source, provider) AS source, provider, {', '.join(flags)}
+                       FROM price_observations WHERE name=? AND provider=? AND price IS NOT NULL {where}
+                         AND COALESCE(source, '') NOT LIKE 'csgotrader:steam:last_%'
+                       ORDER BY observed_at"""
+        return [dict(row) for row in conn.execute(sql, flag_params + tail_params)]
+
+    def window_rows(rows, index):
+        return [row for row in rows if row[f'eligible_{index}']]
+
+    rebuilt = {window: 0 for window in windows}
     for name, provider_rows in by_name.items():
-        primary = None
-        for provider in PRIMARY_PRICE_PROVIDER_ORDER:
-            if provider in provider_rows:
-                primary = provider_rows[provider]
-                break
+        primary = next((provider_rows[p] for p in PRIMARY_PRICE_PROVIDER_ORDER if p in provider_rows), None)
         if not primary:
             continue
-        provider = primary.get('provider')
-        steam_params = [name]
-        steam_where = ''
-        if cutoff:
-            steam_where = ' AND COALESCE(point_ts,0) >= ?'
-            steam_params.append(max(0, cutoff - OBSERVATION_BUCKET_SECONDS))
-        steam_rows = [dict(r) for r in conn.execute(f"""
-            SELECT name, point_ts, price, volume, 'steam_history' AS source, 'steam_history' AS provider
-            FROM price_history
-            WHERE provider='steam' AND name=? AND price IS NOT NULL {steam_where}
-            ORDER BY point_ts
-        """, steam_params)]
-        current_price = _positive_float(primary.get('solid_price')) or _positive_float(primary.get('price'))
-        current_ts = int(primary.get('updated_at') or time.time())
-        metric_rows = []
-        metric_source = 'insufficient'
-        if steam_rows:
-            metric_rows = steam_rows
-            metric_source = 'steam_history'
-        else:
+        steam_rows = read_series(name, windows)
+        fallback_windows = []
+        for index, window in enumerate(windows):
+            rows = window_rows(steam_rows, index)
+            if rows:
+                rebuilt[window] += store_market_metric_window_rows(conn, name, window, primary, rows, 'steam_history')
+                continue
+            # Keep the exact source-specific anchor seek and its no-cutoff rule.
+            # The helper's current quote lookup is small and preserves its full
+            # compatibility behavior; only the large raw ranges are shared.
             steam_current = provider_rows.get('steam_snapshot') or {}
-            steam_current_price = _positive_float(steam_current.get('solid_price')) or _positive_float(steam_current.get('price'))
-            steam_current_ts = int(steam_current.get('updated_at') or current_ts)
-            anchor_rows = csgotrader_window_anchor_rows(
-                conn,
-                name,
-                window_days,
-                current_price=steam_current_price,
-                current_ts=steam_current_ts,
+            current_ts = int(primary.get('updated_at') or time.time())
+            anchors = csgotrader_window_anchor_rows(
+                conn, name, window,
+                current_price=_positive_float(steam_current.get('solid_price')) or _positive_float(steam_current.get('price')),
+                current_ts=int(steam_current.get('updated_at') or current_ts),
             )
-            if anchor_rows:
-                metric_rows = anchor_rows
-                metric_source = 'csgotrader_window_anchor'
+            if anchors:
+                rebuilt[window] += store_market_metric_window_rows(conn, name, window, primary, anchors, 'csgotrader_window_anchor')
             else:
-                obs_params = [name, provider]
-                obs_where = ''
-                if cutoff:
-                    obs_where = ' AND COALESCE(observed_at,0) >= ?'
-                    obs_params.append(max(0, cutoff - OBSERVATION_BUCKET_SECONDS))
-                metric_rows = [dict(r) for r in conn.execute(f"""
-                    SELECT name, observed_at AS point_ts, price, volume,
-                           COALESCE(source, provider) AS source, provider
-                    FROM price_observations
-                    WHERE name=? AND provider=? AND price IS NOT NULL {obs_where}
-                      AND COALESCE(source, '') NOT LIKE 'csgotrader:steam:last_%'
-                    ORDER BY observed_at
-                """, obs_params)]
-                metric_source = 'provider_observations' if metric_rows else 'insufficient'
-        if current_price and metric_source in ('steam_history', 'provider_observations'):
-            metric_rows = [r for r in metric_rows if int(r.get('point_ts') or 0) != current_ts]
-            metric_rows.append({
-                'name': name,
-                'point_ts': current_ts,
-                'price': current_price,
-                'volume': 0,
-                'source': primary.get('source') or provider,
-                'provider': provider,
-            })
-        metrics = volatility_metrics_from_rows(metric_rows)
-        if metrics.get('points'):
-            span = int(metrics.get('lastTs') or current_ts) - int(metrics.get('firstTs') or current_ts)
-            min_span = metric_window_min_span(window_days)
-            prior = sane_prior_price(current_price, metrics.get('firstPrice')) if int(metrics.get('cleanPoints') or metrics.get('points') or 0) >= 2 and span >= min_span else None
-            if metric_source == 'csgotrader_window_anchor':
-                prior = sane_prior_price(current_price, metrics.get('firstPrice'))
-                if prior is None:
-                    # The CSGO Trader window anchor is only a two-point hint.
-                    # If that prior cannot pass the same sanity guard used for
-                    # returns, do not let it appear as a volatility headline.
-                    metrics['volatilityPct'] = None
-                    metrics['rangePct'] = None
-                    metrics['trendPct'] = None
-                    metrics['metricState'] = 'insufficient'
-                    metric_source = 'insufficient'
-                else:
-                    movement_pct = _finite_float(metrics.get('trendPct'))
-                    range_pct = _finite_float(metrics.get('rangePct'))
-                    if movement_pct is not None or range_pct is not None:
-                        metrics['volatilityPct'] = round(abs(movement_pct if movement_pct is not None else range_pct), 2)
-            coverage_pct = 100 if not window_days else round(min(100, (span / max(1, window_days * 86400)) * 100), 1)
-            metrics['spanSeconds'] = span
-            metrics['spanDays'] = round(span / 86400, 2) if span else 0
-            metrics['windowCoveragePct'] = coverage_pct
-            metrics['isPartialWindow'] = bool(window_days and span < min_span and metric_source != 'csgotrader_window_anchor')
-            metrics['metricBasis'] = metric_source
-            metrics['metricState'] = metrics.get('metricState') or ('estimated' if metric_source == 'csgotrader_window_anchor' else ('partial' if metrics['isPartialWindow'] else 'real'))
-            metrics['confidencePct'] = metric_source_confidence(metric_source, span, window_days, int(metrics.get('cleanPoints') or metrics.get('points') or 0))
-            store_item_market_metric(
-                conn,
-                name,
-                window_days,
-                metrics,
-                current_price=current_price,
-                prior_price=prior,
-                price_source=metric_source,
-            )
-            rebuilt += 1
+                fallback_windows.append(window)
+        # Drop the largest series before loading the alternative source.
+        del steam_rows
+        rows = None
+        if fallback_windows:
+            observations = read_series(name, fallback_windows, provider=primary.get('provider'))
+            for index, window in enumerate(fallback_windows):
+                rows = window_rows(observations, index)
+                source = 'provider_observations' if rows else 'insufficient'
+                rebuilt[window] += store_market_metric_window_rows(conn, name, window, primary, rows, source)
+            del observations
+            rows = None
     conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('metric_build_version',?)", (str(METRIC_BUILD_VERSION),))
     conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('lookup_build_version',?)", (str(LOOKUP_BUILD_VERSION),))
+    revision = (conn.execute("SELECT value FROM settings WHERE key='market_source_revision'").fetchone() or {'value': None})['value']
+    for window in windows:
+        save_market_read_receipt(conn, 'market_metric_receipt:'+str(window), {
+            'buildVersion': METRIC_BUILD_VERSION, 'builtAt': int(time.time()),
+            'complete': not bool(clean_names), 'rows': rebuilt[window] if not clean_names else None,
+            'sourceRevision': revision,
+        })
     return rebuilt
 
 
-def rebuild_metrics_for_names(names, windows=VOLATILITY_DETAIL_WINDOWS):
-    """Refresh derived movement rows after raw Steam history changes."""
+def store_market_metric_window_rows(conn, name, window_days, primary, metric_rows, metric_source):
+    """Use the existing complete-window statistics after selecting its exact input."""
+    provider = primary.get('provider')
+    current_price = _positive_float(primary.get('solid_price')) or _positive_float(primary.get('price'))
+    current_ts = int(primary.get('updated_at') or time.time())
+    if current_price and metric_source in ('steam_history', 'provider_observations'):
+        metric_rows = [r for r in metric_rows if int(r.get('point_ts') or 0) != current_ts]
+        metric_rows.append({
+            'name': name,
+            'point_ts': current_ts,
+            'price': current_price,
+            'volume': 0,
+            'source': primary.get('source') or provider,
+            'provider': provider,
+        })
+    metrics = volatility_metrics_from_rows(metric_rows)
+    if metrics.get('points'):
+        span = int(metrics.get('lastTs') or current_ts) - int(metrics.get('firstTs') or current_ts)
+        min_span = metric_window_min_span(window_days)
+        prior = sane_prior_price(current_price, metrics.get('firstPrice')) if int(metrics.get('cleanPoints') or metrics.get('points') or 0) >= 2 and span >= min_span else None
+        if metric_source == 'csgotrader_window_anchor':
+            prior = sane_prior_price(current_price, metrics.get('firstPrice'))
+            if prior is None:
+                # The CSGO Trader window anchor is only a two-point hint.
+                # If that prior cannot pass the same sanity guard used for
+                # returns, do not let it appear as a volatility headline.
+                metrics['volatilityPct'] = None
+                metrics['rangePct'] = None
+                metrics['trendPct'] = None
+                metrics['metricState'] = 'insufficient'
+                metric_source = 'insufficient'
+            else:
+                movement_pct = _finite_float(metrics.get('trendPct'))
+                range_pct = _finite_float(metrics.get('rangePct'))
+                if movement_pct is not None or range_pct is not None:
+                    metrics['volatilityPct'] = round(abs(movement_pct if movement_pct is not None else range_pct), 2)
+        coverage_pct = 100 if not window_days else round(min(100, (span / max(1, window_days * 86400)) * 100), 1)
+        metrics['spanSeconds'] = span
+        metrics['spanDays'] = round(span / 86400, 2) if span else 0
+        metrics['windowCoveragePct'] = coverage_pct
+        metrics['isPartialWindow'] = bool(window_days and span < min_span and metric_source != 'csgotrader_window_anchor')
+        metrics['metricBasis'] = metric_source
+        metrics['metricState'] = metrics.get('metricState') or ('estimated' if metric_source == 'csgotrader_window_anchor' else ('partial' if metrics['isPartialWindow'] else 'real'))
+        metrics['confidencePct'] = metric_source_confidence(metric_source, span, window_days, int(metrics.get('cleanPoints') or metrics.get('points') or 0))
+        store_item_market_metric(
+            conn,
+            name,
+            window_days,
+            metrics,
+            current_price=current_price,
+            prior_price=prior,
+            price_source=metric_source,
+        )
+        return 1
+    return 0
+
+
+
+def begin_history_refresh_write(conn, state):
+    """Track only a continuous sequence of explicit history/quote writes."""
+    if state is None:
+        return
+    revision = conn.execute("SELECT value FROM settings WHERE key='market_source_revision'").fetchone()
+    revision = revision['value'] if revision else None
+    if 'expectedRevision' not in state:
+        state['completeWindows'] = {
+            window: metric_window_is_current(conn, window) for window in RESEARCH_METRIC_WINDOWS
+        }
+    elif state['expectedRevision'] != revision:
+        # Another writer changed inputs that this bounded batch cannot repair.
+        state['completeWindows'] = {}
+    state['expectedRevision'] = revision
+
+
+def finish_history_refresh_write(conn, state):
+    if state is None:
+        return
+    flush_market_source_revision(conn)
+    revision = conn.execute("SELECT value FROM settings WHERE key='market_source_revision'").fetchone()
+    state['expectedRevision'] = revision['value'] if revision else None
+
+
+def rebuild_metrics_for_names(names, windows=RESEARCH_METRIC_WINDOWS, refresh_state=None):
+    """Finalize affected metrics and their cached lookup after an explicit batch.
+
+    Raw history work stays bounded to names. The lookup projection/summary is
+    rebuilt once per window from cached metrics, never from an ordinary GET.
+    """
     clean = [n for n in dict.fromkeys(str(n or '').strip() for n in names or []) if n]
     if not clean:
         return 0
+    with closing(steam_ask_db()) as stage_probe:
+        if bulk_staging_adopted(stage_probe):
+            BULK_STAGING_RUNTIME.request()
+            return 0
     rebuilt = 0
     with SQLITE_WRITE_LOCK:
-        with db() as conn:
-            for window in windows or VOLATILITY_DETAIL_WINDOWS:
-                rebuilt += rebuild_market_metrics(conn, window, names=clean)
+        with closing(db()) as conn, conn:
+            conn.execute('BEGIN IMMEDIATE')
+            begin_history_refresh_write(conn, refresh_state)
+            windows = tuple(windows or RESEARCH_METRIC_WINDOWS)
+            counts = rebuild_market_metric_windows(conn, windows, names=clean)
+            rebuilt += sum(counts.values())
+            for window in windows:
+                if refresh_state and refresh_state.get('completeWindows', {}).get(window):
+                    receipt = market_read_receipt(conn, 'market_metric_receipt:'+str(window))
+                    receipt['complete'] = True
+                    receipt['rows'] = conn.execute(
+                        "SELECT COUNT(*) FROM item_market_metrics WHERE provider='market' AND window_days=?",
+                        (window,),
+                    ).fetchone()[0]
+                    save_market_read_receipt(conn, 'market_metric_receipt:'+str(window), receipt)
+                rebuild_market_item_lookup(conn, window)
             conn.commit()
     return rebuilt
 
@@ -3265,30 +5612,110 @@ def metric_row_to_volatility(row):
     }
 
 
+def market_read_receipt(conn, key):
+    row = conn.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
+    try:
+        value = json.loads(row['value']) if row else None
+        return value if isinstance(value, dict) else None
+    except (ValueError, TypeError):
+        return None
+
+
+def save_market_read_receipt(conn, key, value):
+    """Called by explicit ingestion/rebuild transactions, never by a GET."""
+    conn.execute('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)',
+                 (key,json.dumps(value,separators=(',',':'),allow_nan=False)))
+
+
+def mark_market_source_changed(conn):
+    if isinstance(conn,MarketWriteConnection):
+        conn._market_dirty = True
+        return
+    conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('market_source_revision',?)",
+                 (str(time.time_ns()),))
+    if not getattr(conn, '_bulk_sidecar', False) and bulk_staging_adopted(conn):
+        bulk_derived_staging.invalidate_inputs(conn, 'legacy_plain_source_or_metadata')
+        BULK_STAGING_RUNTIME.request()
+
+
+def flush_market_source_revision(conn):
+    if isinstance(conn,MarketWriteConnection):
+        conn.flush_market_revision()
+
+
+def mark_catalog_source_changed(conn):
+    conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('catalog_metadata_revision',?)",(str(time.time_ns()),))
+    mark_market_source_changed(conn)
+
+
+def market_cache_state(conn, window_days):
+    receipt = market_read_receipt(conn,'market_lookup_receipt:'+str(window_days))
+    row = conn.execute('SELECT value FROM settings WHERE key=?',('market_source_revision',)).fetchone()
+    revision = row['value'] if row else None
+    available = bool(conn.execute('SELECT 1 FROM market_item_lookup WHERE window_days=? LIMIT 1',(window_days,)).fetchone())
+    prepared = bool(receipt and receipt.get('lookupBuildVersion')==LOOKUP_BUILD_VERSION and
+                    receipt.get('metricBuildVersion')==METRIC_BUILD_VERSION and receipt.get('metricsVerified'))
+    current = prepared and revision is not None and receipt.get('sourceRevision')==revision and not getattr(conn,'_market_dirty',False)
+    generation_status = getattr(conn, '_derived_generation_status', None)
+    if generation_status and generation_status != 'legacy_canonical':
+        current = current and generation_status == 'current_generation'
+    elif bulk_staging_enabled(conn) and not getattr(conn, '_bulk_sidecar', False):
+        current = current and bulk_derived_staging.published_state(conn, BULK_STAGING_HOST.engine.external)['current']
+    recovered = recovered_research_status(conn, window_days) if available and not current else None
+    return {'cacheState':'missing' if not available else ('current' if current else 'recovered_historical' if recovered else 'stale'),
+            'dataState':'saved','rebuildRequired':not current,
+            'freshness':{'builtAt':receipt.get('builtAt') if receipt else None,
+                         'sourceAsOf':receipt.get('sourceAsOf') if receipt else recovered.get('sourceAsOf') if recovered else None,
+                         'currentness':'matched_writer_revision' if current else 'recovered_historical_snapshot' if recovered else 'unverified_saved_cache'},
+            'receiptAvailable':bool(receipt),
+            **({'recovery':recovered} if recovered else {})}
+
+
+def recovered_research_status(conn, window_days):
+    """Small provenance read; recovery time never becomes a quote timestamp."""
+    try:
+        import research_recovery
+        receipt = research_recovery.recovery_status(conn)
+    except (ImportError, sqlite3.Error, ValueError, TypeError):
+        return None
+    if not receipt:
+        return None
+    window = next((row for row in receipt.get('windows', []) if row.get('days') == window_days), None)
+    if not window:
+        return None
+    as_of = receipt.get('asOf') or {}
+    clocks = [value for key in ('quotesObservedAt', 'quotesUpdatedAt', 'metricsHistoryLastAt', 'metricsUpdatedAt')
+              for value in as_of.get(key, []) if isinstance(value, (int, float)) and value > 0]
+    return {'state':'recovered_historical','windowDays':window_days,'lookupRowsAtRecovery':window.get('rows'),
+            'sourceAsOf':max(clocks) if clocks else None,'originalAsOf':as_of,
+            'sourceFingerprint':receipt.get('sourceFingerprint'),'recoveredAt':receipt.get('appliedAt'),
+            'rawSteamHistoryRestored':False,'rawSteamChartRowsImported':0,'currentQuotes':False,
+            'meaning':'Preserved dated provider snapshots and aggregate metrics; not fresh cash prices or raw Steam chart observations.'}
+
+
+def preserve_recovered_research_without_inputs(conn):
+    """A recovered aggregate is evidence, not a substitute raw input series."""
+    try:
+        import research_recovery
+        if not research_recovery.recovery_status(conn):
+            return False
+    except (ImportError, sqlite3.Error, ValueError, TypeError):
+        return False
+    raw = conn.execute("SELECT 1 FROM price_history WHERE provider='steam' AND price>0 LIMIT 1").fetchone()
+    observed = conn.execute('SELECT 1 FROM price_observations WHERE price>0 LIMIT 1').fetchone()
+    return not raw and not observed
+
+
 def metric_window_is_current(conn, window_days):
-    row = conn.execute(
-        """SELECT COUNT(*) AS n,
-                  SUM(CASE WHEN raw LIKE ? THEN 1 ELSE 0 END) AS current_rows
-           FROM item_market_metrics
-           WHERE provider='market' AND window_days=?""",
-        (f'%"metricBuildVersion":{METRIC_BUILD_VERSION}%', int(window_days or 0)),
-    ).fetchone()
-    total = int(row['n'] or 0) if row else 0
-    current = int(row['current_rows'] or 0) if row else 0
-    return total > 0 and total == current
+    receipt = market_read_receipt(conn,'market_metric_receipt:'+str(window_days))
+    revision = conn.execute("SELECT value FROM settings WHERE key='market_source_revision'").fetchone()
+    return bool(receipt and revision and receipt.get('complete') and receipt.get('buildVersion')==METRIC_BUILD_VERSION and
+                receipt.get('sourceRevision')==revision['value'] and not getattr(conn,'_market_dirty',False))
 
 
 def ensure_metric_window_current(conn, window_days):
-    """Serialize metric rebuilds that can be triggered from read-heavy pages."""
-    if metric_window_is_current(conn, window_days):
-        return False
-    with SQLITE_WRITE_LOCK:
-        with db() as write_conn:
-            if metric_window_is_current(write_conn, window_days):
-                return False
-            rebuild_market_metrics(write_conn, window_days)
-            write_conn.commit()
-            return True
+    """Compatibility probe; reads must never schedule or perform a rebuild."""
+    return False
 
 
 def get_cached_market_metric_map(conn, names, history_days=90):
@@ -3375,18 +5802,22 @@ def history_quote_from_points(name, market_hash_name, points, updated_at=None):
     }
 
 
-def save_history_quote(name, market_hash_name, points, updated_at=None):
+def save_history_quote(name, market_hash_name, points, updated_at=None, _refresh_state=None):
     quote = history_quote_from_points(name, market_hash_name, points, updated_at)
     if not quote:
         return None
     with SQLITE_WRITE_LOCK:
         with db() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            begin_history_refresh_write(conn, _refresh_state)
             for quote_name in dict.fromkeys([name, market_hash_name or name]):
                 if not quote_name:
                     continue
                 row = {**quote, 'name': quote_name}
                 upsert_market_item_price(conn, row, provider='steam_history', source='steam_history')
                 save_price_observation(conn, row, source='steam_history', observed_at=updated_at, provider='steam_history')
+            mark_market_source_changed(conn)
+            finish_history_refresh_write(conn, _refresh_state)
     return quote
 
 
@@ -3445,6 +5876,77 @@ def attach_market_valuation(item, quote, volatility):
     return item
 
 
+def get_portfolio_current_value(limit=2000, portfolio_id=None):
+    """Read saved current valuations only; analytics and freshness are separate."""
+    limit = parse_int_param(limit, 2000, minimum=1, maximum=10000)
+    exact_meta, base_meta, _catalog_count = catalog_index()
+    with closing(catalog_read_db()) as conn:
+        conn.execute('BEGIN')
+        portfolio = latest_portfolio(conn, portfolio_id)
+        revision = conn.execute("SELECT value FROM settings WHERE key='market_source_revision'").fetchone()
+        source_revision = revision['value'] if revision else None
+        total = conn.execute('SELECT COUNT(*) FROM portfolio_items WHERE portfolio_id=?',
+                             (portfolio['portfolio_id'],)).fetchone()[0] if portfolio else 0
+        held = portfolio_inventory_rows(conn, portfolio['portfolio_id'], limit) if portfolio else []
+        enriched = [enrich_item(row, exact_meta, base_meta) for row in held]
+        names = list(dict.fromkeys(name for item in enriched
+                                  for name in (item.get('name'), item.get('marketHashName')) if name))
+        quotes = best_market_quotes(conn, names)
+
+    items = []
+    groups = {}
+    for item in enriched:
+        quote = quotes.get(item.get('marketHashName')) or quotes.get(item.get('name')) or {}
+        unit = _positive_float(quote.get('price')) or _positive_float(quote.get('median'))
+        qty = _positive_float(item.get('qty')) or 0
+        value = round(unit * qty, 2) if unit and qty else None
+        provider = quote.get('provider') if unit else None
+        basis = 'steam_aggregate' if provider == 'steam_snapshot' else 'cash_fallback' if provider else 'missing'
+        captured = int(quote.get('updated_at') or 0) or None
+        selected = {key: quote.get(key) for key in
+                    ('provider', 'price', 'median', 'source', 'priceBasis', 'updated_at',
+                     'priceSemantics', 'executableAsk')}
+        row = {
+            'name': item.get('name'), 'marketHashName': item.get('marketHashName'),
+            'qty': item.get('qty'), 'marketCurr': value,
+            'marketUnitPrice': round(unit, 2) if unit else None,
+            'marketPast': None, 'marketQuoteProvider': provider,
+            'marketPriceSource': quote.get('source'), 'marketPriceBasis': quote.get('priceBasis'),
+            'marketQuoteCapturedAt': captured, 'marketQuoteStale': None,
+            'quoteAvailable': bool(unit),
+            'availableProviders': [key for key, value in (quote.get('providerPrices') or {}).items()
+                                   if _positive_float(value.get('price')) or _positive_float(value.get('median'))],
+            'valueBasis': basis, 'quote': selected,
+        }
+        items.append(row)
+        group = groups.setdefault(basis, {'items': 0, 'quantity': 0, 'value': 0,
+                                         'oldestCaptureAt': None, 'latestCaptureAt': None})
+        group['items'] += 1
+        group['quantity'] += qty
+        group['value'] += value or 0
+        if captured:
+            group['oldestCaptureAt'] = min(group['oldestCaptureAt'] or captured, captured)
+            group['latestCaptureAt'] = max(group['latestCaptureAt'] or captured, captured)
+    for group in groups.values():
+        group['quantity'] = round(group['quantity'], 2)
+        group['value'] = round(group['value'], 2)
+    steam = groups.get('steam_aggregate', {})
+    cash = groups.get('cash_fallback', {})
+    return {
+        'projection': 'portfolio-value-v1', 'portfolio': portfolio, 'items': items,
+        'currentSourceRevision': source_revision,
+        'valuationState': 'saved_current_quotes', 'freshnessState': 'not_evaluated',
+        'analyticsState': 'not_requested',
+        'totals': {'savedValue': round(sum(row['marketCurr'] or 0 for row in items), 2),
+                   'steamAggregateValue': steam.get('value', 0),
+                   'cashFallbackValue': cash.get('value', 0)},
+        'coverage': {'totalPortfolioItems': total, 'returnedItems': len(items),
+                     'truncated': len(items) < total, 'quoteCoverage': sum(row['quoteAvailable'] for row in items),
+                     'missingMarketPrices': sum(not row['quoteAvailable'] for row in items),
+                     'groups': groups, 'historyFallbackUsed': False},
+    }
+
+
 def get_inventory_dataset(scale_days=90, history_days=None, limit=2000, refresh=False, refresh_limit=25, refresh_history=False, history_limit=10, portfolio_id=None, force=False):
     """Return a portfolio with locally cached per-item quote/volatility fields."""
     history_days = parse_int_param(history_days if history_days is not None else scale_days, 90, allowed=VOLATILITY_WINDOWS)
@@ -3452,7 +5954,7 @@ def get_inventory_dataset(scale_days=90, history_days=None, limit=2000, refresh=
     refresh_limit = parse_int_param(refresh_limit, 25, minimum=1, maximum=200)
     history_limit = parse_int_param(history_limit, 10, minimum=1, maximum=50)
     exact_meta, base_meta, catalog_count = catalog_index()
-    with db() as conn:
+    with closing(catalog_read_db()) as conn:
         portfolio = latest_portfolio(conn, portfolio_id)
         if not portfolio:
             return {'scaleDays': history_days, 'historyDays': history_days, 'portfolio': None, 'snapshot': None, 'items': [], 'coverage': {'items': 0}}
@@ -3469,10 +5971,13 @@ def get_inventory_dataset(scale_days=90, history_days=None, limit=2000, refresh=
         market_universe_bulk_sync('csgotrader', 'any')
 
     if refresh_history:
+        refresh_state = {}
         for item in items[:history_limit]:
-            get_price_history(item.get('name'), force=force, market_hash_name=item.get('marketHashName'))
+            get_price_history(item.get('name'), force=force, market_hash_name=item.get('marketHashName'),
+                              rebuild_metrics=False, _refresh_state=refresh_state)
+        rebuild_metrics_for_names(refresh_state.get('names'), refresh_state=refresh_state)
 
-    with db() as conn:
+    with closing(catalog_read_db()) as conn:
         quotes = best_market_quotes(conn, quote_names)
         vol, metric_window, metric_window_exact = get_cached_market_metric_map(conn, quote_names, history_days)
         volatility_windows = {}
@@ -3663,7 +6168,7 @@ def refresh_steam_history_for_chart_items(
 
     limit = parse_int_param(limit, 0, minimum=0, maximum=250)
     if limit <= 0:
-        return {'attempted': 0, 'refreshed': 0, 'errors': []}
+        return {'attempted': 0, 'refreshed': 0, 'failed': 0, 'cachedFallback': 0, 'errors': []}
     raw_items = list(items or [])
     fetchable_items = [item for item in raw_items if is_fetchable_steam_history_item(item)]
     skipped_unfetchable = len(raw_items) - len(fetchable_items)
@@ -3697,13 +6202,18 @@ def refresh_steam_history_for_chart_items(
         ),
         reverse=True,
     )
-    max_attempts = min(len(ranked), max(limit * 4, limit + 12))
+    # A canonical redirect needs a later, separately admitted request for the
+    # same item. Count actual HTTP attempts independently of unique candidates.
+    max_attempts = max(limit * 4, limit + 12)
     attempted = 0
     refreshed = 0
+    cached_fallback = 0
     skipped_failures = 0
     errors = []
     failure_records = []
     successful_names = []
+    refresh_state = {}
+    rate_limit = {}
     report(
         'queued',
         f"Queued up to {limit:,} Steam chart fetches from {len(ranked):,} candidates",
@@ -3712,7 +6222,9 @@ def refresh_steam_history_for_chart_items(
         skippedUnfetchable=skipped_unfetchable,
     )
     for item in ranked:
-        if refreshed >= limit or attempted >= max_attempts:
+        # Cached fallbacks consumed this budget before refresh reporting was
+        # separated from chart availability. Keep the same provider work cap.
+        if refreshed + cached_fallback >= limit or attempted >= max_attempts:
             break
         name = (item.get('name') or item.get('marketHashName') or '').strip()
         if not name:
@@ -3722,24 +6234,44 @@ def refresh_steam_history_for_chart_items(
         if name in recent_failures and not force and not retry_failures:
             skipped_failures += 1
             continue
-        attempted += 1
-        report(
-            'item',
-            f"Steam chart {attempted}/{limit}: {name}",
-            item=name,
-            marketHashName=item.get('marketHashName') or name,
-            attempted=attempted,
-            limit=limit,
-            refreshed=refreshed,
-            skippedRecentFailures=skipped_failures,
-        )
-        hist = get_price_history(
-            name,
-            force=True,
-            market_hash_name=(item.get('marketHashName') or name),
-            rebuild_metrics=False,
-        )
-        if hist.get('points'):
+        wait_for_provider = getattr(progress, '_wait_for_provider', None)
+        while True:
+            attempted += 1
+            if wait_for_provider and not wait_for_provider():
+                hist = {'governorDeferred': True, 'reason': 'task_control', 'points': []}
+                break
+            report('item', f"Steam chart {attempted}/{limit}: {name}", item=name,
+                   marketHashName=item.get('marketHashName') or name,
+                   attempted=attempted, limit=limit, refreshed=refreshed,
+                   skippedRecentFailures=skipped_failures)
+            hist = get_price_history(name, force=True,
+                market_hash_name=(item.get('marketHashName') or name),
+                rebuild_metrics=False, _refresh_state=refresh_state)
+            deferred = hist.get('governorDeferred') or hist.get('rateLimited')
+            if deferred and wait_for_provider:
+                if attempted >= max_attempts:
+                    hist = dict(hist, historyAttemptCapReached=True)
+                    break
+                if wait_for_provider(hist):
+                    if not hist.get('networkAttempted') and not hist.get('refreshAttempted'):
+                        attempted -= 1
+                    continue
+            break
+        if hist.get('governorDeferred'):
+            attempted -= 0 if hist.get('networkAttempted') else 1
+            cached_fallback += bool(hist.get('points'))
+            rate_limit = {key:hist.get(key) for key in ('governorDeferred','reason','retryAt','operatorPaused','recoveryRequired','canonicalRedirect','networkAttempted','httpStatus','historyAttemptCapReached')}
+            report('governor_deferred', 'Steam acquisition paused or waiting for its durable budget; stopped this batch', **rate_limit)
+            break
+        if hist.get('rateLimited'):
+            rate_limit = {key: hist.get(key) for key in
+                          ('rateLimited', 'httpStatus', 'retryAt', 'retryAfter', 'cooldownActive','historyAttemptCapReached')}
+            if hist.get('cooldownActive'):
+                attempted -= 1  # The provider was not contacted for this target.
+                cached_fallback += bool(hist.get('points'))
+                report('rate_limited', 'Steam Retry-After cooldown is active; stopped this batch', **rate_limit)
+                break
+        if hist.get('historySaved'):
             refreshed += 1
             successful_names.append(name)
             report(
@@ -3752,10 +6284,11 @@ def refresh_steam_history_for_chart_items(
                 pointCount=len(hist.get('points') or []),
             )
         else:
+            cached_fallback += bool(hist.get('points'))
             failure = {
                 'name': name,
                 'marketHashName': item.get('marketHashName') or name,
-                'error': hist.get('error') or 'No Steam chart rows returned',
+                'error': hist.get('refreshError') or hist.get('error') or 'No new Steam chart rows were saved',
             }
             failure_records.append(failure)
             if len(errors) < 5:
@@ -3769,29 +6302,45 @@ def refresh_steam_history_for_chart_items(
                 refreshed=refreshed,
                 error=failure['error'],
             )
+            if hist.get('rateLimited'):
+                report('rate_limited', 'Steam returned HTTP429; stopped this batch', **rate_limit)
+                break
     save_steam_history_failures(failure_records)
     clear_steam_history_failures(successful_names)
-    rebuilt_metrics = rebuild_metrics_for_names(successful_names) if successful_names else 0
+    rebuilt_metrics = rebuild_metrics_for_names(refresh_state.get('names'), refresh_state=refresh_state)
     return {
         'attempted': attempted,
         'refreshed': refreshed,
+        'failed': len(failure_records),
+        'cachedFallback': cached_fallback,
         'rebuiltMetrics': rebuilt_metrics,
         'skippedRecentFailures': skipped_failures,
         'skippedUnfetchable': skipped_unfetchable,
         'errors': errors,
+        'stoppedReason': 'governor_deferred' if rate_limit.get('governorDeferred') else 'rate_limited' if rate_limit else None,
+        **rate_limit,
     }
 
 
-def latest_portfolio_history_candidates(limit=120, portfolio_id=None):
+def latest_portfolio_history_candidates(limit=120, portfolio_id=None, all_items=False):
     """Return portfolio items most likely to drive visible value curves."""
-    limit = parse_int_param(limit, 120, minimum=0, maximum=1000)
+    limit = parse_int_param(limit, 120, minimum=0, maximum=10000 if all_items else 1000)
     if limit <= 0:
         return []
     exact_meta, base_meta, _catalog_count = catalog_index()
     with db() as conn:
         portfolio = latest_portfolio(conn, portfolio_id)
         if not portfolio:
+            if portfolio_id:
+                raise ValueError('Selected portfolio no longer exists; no other portfolio was warmed.')
             return []
+        if portfolio_id and portfolio['portfolio_id'] != portfolio_id:
+            raise ValueError('Selected portfolio no longer exists; no other portfolio was warmed.')
+        if all_items:
+            count = conn.execute('SELECT COUNT(*) FROM portfolio_items WHERE portfolio_id=?',
+                                 (portfolio['portfolio_id'],)).fetchone()[0]
+            if count > 10000:
+                raise ValueError('Selected portfolio exceeds the 10,000-row tracked history scope; no truncated sync was started.')
         rows = portfolio_inventory_rows(conn, portfolio['portfolio_id'], 10000)
         items = [enrich_item(r, exact_meta, base_meta) for r in rows]
         quote_names = []
@@ -3830,7 +6379,7 @@ def market_history_candidates(limit=120, history_days=90):
     if limit <= 0:
         return []
     history_days = parse_int_param(history_days, 90, allowed=VOLATILITY_WINDOWS)
-    with db() as conn:
+    with closing(catalog_read_db()) as conn:
         metric_window, _exact_window, _metric_count = resolve_market_metric_window(conn, history_days)
         ensure_market_item_lookup(conn, metric_window)
         query_limit = max(limit * 2, 80)
@@ -3872,7 +6421,7 @@ def market_history_candidates(limit=120, history_days=90):
     return ranked[:limit]
 
 
-def warm_steam_history_after_market_sync(limit=None, portfolio_id=None, force=False, retry_failures=False):
+def warm_steam_history_after_market_sync(limit=None, portfolio_id=None, force=False, retry_failures=False, progress=None):
     """Warm enough raw Steam chart history for the main release pages to work."""
     limit = parse_int_param(
         DEFAULT_SYNC_STEAM_HISTORY_LIMIT if limit is None else limit,
@@ -3905,6 +6454,7 @@ def warm_steam_history_after_market_sync(limit=None, portfolio_id=None, force=Fa
         limit=limit,
         force=force,
         retry_failures=retry_failures,
+        progress=progress,
     )
     result.update({
         'enabled': True,
@@ -3920,10 +6470,9 @@ def warm_steam_history_after_market_sync(limit=None, portfolio_id=None, force=Fa
 def aggregate_value_history_for_items(items, history_days=90, points=220, value_basis='portfolio_value', refresh=False, refresh_limit=0, force=False):
     """Build a reusable value curve from cached Steam history.
 
-    Items with Steam chart rows move over time from cleaned raw Steam points.
-    Items without chart rows contribute their current provider valuation as a
-    marked backfill so cold-start group and portfolio curves stay near the
-    current basket value without pretending missing Steam history moved.
+    Only items with genuine dated Steam chart rows contribute. Missing history
+    is excluded with explicit coverage; current quotes never fill a past date.
+    Interpolation between actual observations and later carry are flagged.
     """
     history_days = parse_int_param(history_days, 90, allowed=VOLATILITY_WINDOWS)
     points = parse_int_param(points, 220, minimum=24, maximum=480)
@@ -3998,27 +6547,8 @@ def aggregate_value_history_for_items(items, history_days=90, points=220, value_
             raw_series.extend(series_by_name.get(alias, []))
         series = normalized_history_series(raw_series) if raw_series else []
         key = item['aliases'][0]
-        fallback_price = (
-            _positive_float(item.get('latestPrice'))
-            or _positive_float(item.get('marketUnitPrice'))
-            or _positive_float(item.get('solidPrice'))
-        )
-        current_ts = int(item.get('latestAt') or item.get('updatedAt') or 0)
         if len(series) >= 2:
-            if fallback_price is not None and current_ts and current_ts > int(series[-1].get('ts') or 0):
-                series = list(series)
-                series.append({
-                    'ts': current_ts,
-                    'price': fallback_price,
-                    'volume': 0,
-                    'source': 'current_provider_price',
-                })
-                latest_history_ts = max(latest_history_ts, current_ts)
-                current_anchor_count += 1
             normalized_series[key] = series
-        else:
-            if fallback_price is not None:
-                backfill_prices[key] = fallback_price
 
     items_with_history = len(normalized_series)
     if not normalized_series:
@@ -4027,6 +6557,9 @@ def aggregate_value_history_for_items(items, history_days=90, points=220, value_
             'historyDays': history_days,
             'generatedAt': int(time.time()),
             'points': [],
+            'historyAvailable': False,
+            'historyState': 'missing_raw_steam_history',
+            'historyPrerequisite': 'Genuine cached Steam chart observations are required. Use an authenticated history refresh; provider pacing, access and cooldowns still apply.',
             'coverage': {
                 'items': item_count,
                 'itemsWithHistory': 0,
@@ -4045,6 +6578,9 @@ def aggregate_value_history_for_items(items, history_days=90, points=220, value_
                 'carriedForwardPoints': 0,
                 'refreshAttempted': refresh_result.get('attempted', 0),
                 'refreshRefreshed': refresh_result.get('refreshed', 0),
+                'refreshFailed': refresh_result.get('failed', 0),
+                'refreshCachedFallback': refresh_result.get('cachedFallback', 0),
+                'refreshSkippedRecentFailures': refresh_result.get('skippedRecentFailures', 0),
                 'refreshErrors': refresh_result.get('errors') or [],
                 'skippedUnfetchable': refresh_result.get('skippedUnfetchable', 0),
                 'skippedRecentFailures': refresh_result.get('skippedRecentFailures', 0),
@@ -4076,18 +6612,12 @@ def aggregate_value_history_for_items(items, history_days=90, points=220, value_
             key = (item.get('aliases') or [''])[0]
             series = normalized_series.get(key) or []
             if not series:
-                fallback_price = backfill_prices.get(key)
-                if fallback_price is None:
-                    continue
-                total += fallback_price * item['chartQty']
-                contributing += 1
-                backfilled_items += 1
                 continue
             price = None
             if ts < series[0]['ts']:
-                price = series[0]['price']
-                not_started_items += 1
-                carried_forward_items += 1
+                # Never project the first observation backward into dates for
+                # which this item has no historical evidence.
+                continue
             elif ts >= series[-1]['ts']:
                 price = series[-1]['price']
                 if ts > series[-1]['ts']:
@@ -4135,6 +6665,8 @@ def aggregate_value_history_for_items(items, history_days=90, points=220, value_
         'historyDays': history_days,
         'generatedAt': int(time.time()),
         'points': chart_points,
+        'historyAvailable': bool(chart_points),
+        'historyState': 'genuine_cached_steam_history',
         'firstValue': first_value,
         'latestValue': latest_value,
         'coverage': {
@@ -4155,6 +6687,9 @@ def aggregate_value_history_for_items(items, history_days=90, points=220, value_
             'carriedForwardPoints': sum(1 for p in chart_points if p.get('carriedForwardItems')),
             'refreshAttempted': refresh_result.get('attempted', 0),
             'refreshRefreshed': refresh_result.get('refreshed', 0),
+            'refreshFailed': refresh_result.get('failed', 0),
+            'refreshCachedFallback': refresh_result.get('cachedFallback', 0),
+            'refreshSkippedRecentFailures': refresh_result.get('skippedRecentFailures', 0),
             'refreshErrors': refresh_result.get('errors') or [],
             'skippedUnfetchable': refresh_result.get('skippedUnfetchable', 0),
             'skippedRecentFailures': refresh_result.get('skippedRecentFailures', 0),
@@ -4266,10 +6801,13 @@ def portfolio_sync_batch(scale_days=90, history_days=None, offset=0, limit=20, i
 
     history_refreshed = 0
     if include_history:
+        refresh_state = {}
         for item in items:
-            hist = get_price_history(item.get('name'), force=force, market_hash_name=item.get('marketHashName'))
-            if hist.get('points'):
+            hist = get_price_history(item.get('name'), force=force, market_hash_name=item.get('marketHashName'),
+                                     rebuild_metrics=False, _refresh_state=refresh_state)
+            if hist.get('historySaved'):
                 history_refreshed += 1
+        rebuild_metrics_for_names(refresh_state.get('names'), refresh_state=refresh_state)
 
     all_names = []
     with db() as conn:
@@ -4415,20 +6953,28 @@ def portfolio_analysis(portfolio_id=None, history_days=90):
 
 
 def catalog_index():
-    refresh_catalog(False)
-    with db() as conn:
-        rows = [dict(r) for r in conn.execute(
-            """SELECT name, kind, item_type AS type, weapon, collection, rarity,
-                      rarity_color AS rarityColor, image, market_hash_name AS marketHashName
-               FROM item_catalog"""
-        )]
-    exact = {r['name']: r for r in rows}
-    base = {}
-    for r in rows:
-        b = base_item_name(r['name'])
-        if b not in base or r['name'] == b:
-            base[b] = r
-    return exact, base, len(rows)
+    global CATALOG_INDEX_CACHE
+    # At most one immutable metadata index per process, coalesced across tabs.
+    # The short TTL also catches external writers that do not publish revision.
+    with CATALOG_INDEX_LOCK:
+        with closing(catalog_read_db()) as conn:
+            conn.execute('BEGIN')
+            revision = conn.execute("SELECT value FROM settings WHERE key='catalog_metadata_revision'").fetchone()
+            key = (os.path.abspath(DB_FILE),revision['value'] if revision else None)
+            if CATALOG_INDEX_CACHE and CATALOG_INDEX_CACHE[0]==key and time.monotonic()-CATALOG_INDEX_CACHE[1]<30:
+                return CATALOG_INDEX_CACHE[2]
+            rows = [dict(r) for r in conn.execute(
+                """SELECT name, kind, item_type AS type, weapon, collection, rarity,
+                          rarity_color AS rarityColor, image, market_hash_name AS marketHashName FROM item_catalog""")]
+        exact = {row['name']:row for row in rows}
+        base = {}
+        for row in rows:
+            name = base_item_name(row['name'])
+            if name not in base or row['name']==name:
+                base[name]=row
+        result = (exact,base,len(rows))
+        CATALOG_INDEX_CACHE = (key,time.monotonic(),result)
+        return result
 
 
 def enrich_item(row, exact_meta, base_meta):
@@ -4445,7 +6991,8 @@ def enrich_item(row, exact_meta, base_meta):
         'class': meta.get('weapon') or meta.get('type') or row.get('category'),
         'collection': meta.get('collection'),
         'kind': meta.get('kind'),
-        'marketHashName': meta.get('marketHashName') or row['name'],
+        # Family metadata may enrich a variant, but cannot change its listing.
+        'marketHashName': exact.get('marketHashName') or row['name'],
     })
     for key in ('qty', 'pct', 'dollar', 'curr', 'past', 'unit_curr', 'unit_past'):
         if row.get(key) is not None:
@@ -4562,7 +7109,7 @@ def knife_set_name(item):
     return 'Knife Market Index'
 
 
-def market_group_tags(item):
+def market_group_tags(item, collection_alias_resolver=None):
     tags = []
     def add(dim, value):
         value = (value or '').strip() if isinstance(value, str) else value
@@ -4612,7 +7159,8 @@ def market_group_tags(item):
     if is_knife_item(item):
         add('Collection', knife_set_name(item))
     elif kind == 'skins' and item.get('collection'):
-        case_alias = collection_case_alias(item.get('collection'))
+        resolve_alias = collection_case_alias if collection_alias_resolver is None else collection_alias_resolver
+        case_alias = resolve_alias(item.get('collection'))
         add('Collection', case_alias or item.get('collection'))
         if case_alias:
             add('Skin Collection', item.get('collection'))
@@ -4738,7 +7286,7 @@ def quote_from_market_price(name, price, volume=None, upstream='market', source=
     if not name or not price:
         return None
     updated_at = coerce_market_timestamp(updated_at)
-    return {
+    quote = {
         'name': name,
         'provider': 'market',
         'price': price,
@@ -4752,6 +7300,13 @@ def quote_from_market_price(name, price, volume=None, upstream='market', source=
         }, separators=(',', ':')),
         'updated_at': updated_at,
     }
+    # A CSGO Trader Steam value is a selected aggregate, not a live order book.
+    # Preserve its existing numeric price and capture clock while naming the
+    # selector already stored in the raw evidence.
+    basis = csgotrader_steam_aggregate_basis(raw) if upstream == 'csgotrader' and source == 'steam' else None
+    if basis:
+        quote['priceBasis'] = basis
+    return quote
 
 
 def coerce_market_timestamp(value):
@@ -4769,10 +7324,74 @@ def coerce_market_timestamp(value):
     return ts
 
 
-def store_market_quote(conn, quote, source, recalculate=True):
+def catalog_reconcile_saved_quote_binding(conn, name, provider, source, metadata_memo=None):
+    """Reconcile an existing issue without fabricating a replay observation/capture.
+
+    Qualified ordinary rows take one indexed receipt lookup and no native proof
+    work. An explicit-refresh memo can also expose a definition rejected before
+    an unchanged quote reaches this function. Both paths use the saved quote.
+    """
+    if not CATALOG_STORE_ENABLED:
+        return None
+    scope = [provider, source, name]
+    key = 'catalog_native_binding_issue:v1:' + hashlib.sha256(
+        json.dumps(scope, ensure_ascii=False, separators=(',', ':')).encode('utf-8')).hexdigest()
+    saved = conn.execute('SELECT value FROM catalog_store_meta WHERE key=?', (key,)).fetchone()
+    previous = catalog_validate_quote_binding_receipt(json.loads(saved['value']), scope) if saved else None
+    pending = (metadata_memo or {}).get('catalogProjectionUnresolved', {}).get(name)
+    if not pending and (previous is None or previous.get('status') == 'resolved'):
+        return None
+    current = conn.execute('SELECT * FROM market_item_prices WHERE name=? AND provider=?',
+                           (name, provider)).fetchone()
+    if current is None or current['source'] != source:
+        return None  # A different source's newer current row cannot resolve this scope.
+    record = dict(current)
+    if type(record['updated_at']) is not int or record['updated_at'] <= 0:
+        return None  # Preserve the existing replay rule for an unqualified legacy clock.
+    reported_hash = (previous or {}).get('reportedMarketHashName')
+    resolution, binding_states = {}, {}
+    store, item_id = catalog_identity_for_legacy(
+        conn, name, market_hash_name=reported_hash or name, source=source,
+        unresolved_definition=resolution)
+    if item_id is not None:
+        binding_states['market_item_prices'] = store.bind_legacy_or_defer(item_id, 'market_item_prices', name, provider=provider)['status']
+        binding_states['price_observations'] = store.bind_legacy_or_defer(item_id, 'price_observations', name, provider=provider)['status']
+    disposition = (previous or {}).get('currentWriteDisposition') or 'retained_unchanged_current'
+    return catalog_record_quote_binding(conn, record, {'marketHashName': reported_hash},
+                                         resolution if item_id is None else None,
+                                         item_id, disposition, metadata_memo, binding_states=binding_states)
+
+
+def store_market_quote(conn, quote, source, recalculate=True, metadata_memo=None, snapshot_replay=False):
     if not quote:
         return None
     provider_key = provider_key_from_source(source=source, provider=quote.get('provider'), quote=quote)
+    if snapshot_replay:
+        expected = market_price_record_from_quote(quote, provider=provider_key, source=source)
+        if not expected:
+            return None
+        current = conn.execute(
+            "SELECT * FROM market_item_prices WHERE name=? AND provider=?",
+            (quote.get('name'), provider_key),
+        ).fetchone()
+        if current:
+            # Replaying an already ingested representation is not a new market
+            # observation. Repair current facts without rewriting any history,
+            # and keep the existing no-regression rule for newer current data.
+            # INTEGER affinity also permits legacy TEXT/REAL/NULL values. An
+            # older replay cannot safely order an unqualified capture clock.
+            current_at = current['updated_at']
+            if type(current_at) is not int or current_at <= 0:
+                catalog_reconcile_saved_quote_binding(conn, quote.get('name'), provider_key, source, metadata_memo)
+                return 'unchanged'
+            newer = current_at > int(expected['updated_at'] or 0)
+            material = tuple(key for key in expected if key not in ('observed_at', 'updated_at'))
+            if newer or all(current[key] == expected[key] for key in material):
+                catalog_reconcile_saved_quote_binding(conn, quote.get('name'), provider_key, source, metadata_memo)
+                return 'unchanged'
+        repaired = upsert_market_item_price(conn, quote, provider=provider_key, source=source,
+                                            recalculate=recalculate, metadata_memo=metadata_memo)
+        return 'repaired' if repaired else 'unchanged'
     observed_at = observation_bucket(quote.get('updated_at'))
     existed = conn.execute(
         "SELECT price, median, volume FROM price_observations WHERE name=? AND provider=? AND observed_at=?",
@@ -4794,6 +7413,7 @@ def store_market_quote(conn, quote, source, recalculate=True):
             (quote.get('name'), provider_key),
         ).fetchone()
         if current:
+            catalog_reconcile_saved_quote_binding(conn, quote.get('name'), provider_key, source, metadata_memo)
             return 'unchanged'
     save_price_observation(
         conn,
@@ -4802,7 +7422,8 @@ def store_market_quote(conn, quote, source, recalculate=True):
         observed_at=quote.get('updated_at'),
         provider=provider_key,
     )
-    upsert_market_item_price(conn, quote, provider=provider_key, source=source, recalculate=recalculate)
+    upsert_market_item_price(conn, quote, provider=provider_key, source=source,
+                             recalculate=recalculate, metadata_memo=metadata_memo)
     return 'updated' if existed else 'inserted'
 
 
@@ -4876,6 +7497,8 @@ def store_csgotrader_history_points(conn, name, raw_price, source, observed_at):
 
 
 def market_universe_bulk_sync_csgotrader(preferred_source=None, warm_history=False, history_limit=None, portfolio_id=None, retry_history_failures=False, progress=None):
+    BULK_STAGING_RUNTIME.require_bulk_mode()
+    legacy_bulk_capacity_admission()
     started = time.perf_counter()
     timings = {}
     sources = csgotrader_sources(preferred_source)
@@ -4886,11 +7509,14 @@ def market_universe_bulk_sync_csgotrader(preferred_source=None, warm_history=Fal
     updated = 0
     seen = 0
     by_source = {}
+    replayed_sources = []
     errors = []
     unchanged = 0
+    unpriced_discovery = {}
     rebuilt_lookups = 0
     rebuilt_metrics = 0
     removed_stale = 0
+    repaired_current = 0
     changed_primary_names = set()
     observed_at = int(time.time())
     source_payloads = []
@@ -4901,7 +7527,8 @@ def market_universe_bulk_sync_csgotrader(preferred_source=None, warm_history=Fal
             if progress:
                 progress('provider_fetch', f"Fetching {CSGOTRADER_SOURCE_LABELS.get(source, source)} snapshot", source=source)
             req = urllib.request.Request(url, headers={'Accept-Encoding': 'gzip', 'User-Agent': f'{APP_NAME}/{APP_VERSION}'})
-            raw = fetch_json_request(req, timeout=120)
+            fetch_metadata = {}
+            raw = fetch_json_request(req, timeout=120, metadata=fetch_metadata)
         except Exception as exc:
             errors.append({'source': source, 'error': str(exc)})
             if progress:
@@ -4913,79 +7540,135 @@ def market_universe_bulk_sync_csgotrader(preferred_source=None, warm_history=Fal
                 progress('provider_error', f"{CSGOTRADER_SOURCE_LABELS.get(source, source)} snapshot was not usable JSON", source=source)
             continue
         seen += len(raw)
-        source_payloads.append((source, raw))
+        source_payloads.append((source, raw, fetch_metadata))
         if progress:
             progress('provider_received', f"Received {len(raw):,} {CSGOTRADER_SOURCE_LABELS.get(source, source)} rows", source=source, rows=len(raw))
     timings['fetchProviderSnapshotsSeconds'] = round(time.perf_counter() - stage_start, 2)
     stage_start = time.perf_counter()
+    memory_progress = (progress if getattr(progress, '_memory_only', False)
+                       else getattr(progress, '_memory_only_callback', None))
+    if memory_progress:
+        memory_progress('waiting_for_writer', 'Waiting to process provider snapshots')
+    source_transaction_started = time.perf_counter()
+    derived_publication = None
     with SQLITE_WRITE_LOCK:
+        legacy_bulk_capacity_admission()
         with db() as conn:
-            for source, raw in source_payloads:
+            if memory_progress:
+                memory_progress('provider_transaction_started', 'Processing provider snapshots; commit pending')
+            # This memo never escapes this one writer connection/transaction.
+            # No global metadata refresh/repair scan runs inside the provider-row loop.
+            metadata_memo = {'connection': conn, 'names': {}, 'trackMetadataChanges': True}
+            for source, raw, fetch_metadata in source_payloads:
                 provider_key = provider_key_from_source(source='csgotrader:' + source, provider=source)
+                source_observed_at, content_replayed = provider_snapshot_observation(
+                    fetch_metadata, provider_fetch_receipt(conn, provider_key), observed_at)
+                if content_replayed:
+                    replayed_sources.append(source)
                 valid_names = set()
                 before_source_count = count
                 for name, raw_price in raw.items():
-                    chosen = choose_csgotrader_price(raw_price, source)
-                    if not chosen:
+                    if not provider_listing_name_is_usable(name):
+                        unpriced_discovery['rejected_name'] = unpriced_discovery.get('rejected_name', 0) + 1
                         continue
+                    chosen = choose_csgotrader_price(raw_price, source)
+                    if not chosen or not _positive_float(chosen.get('price')):
+                        discovery = discover_unpriced_market_item(conn, name, metadata_memo)
+                        unpriced_discovery[discovery] = unpriced_discovery.get(discovery, 0) + 1
+                        continue
+                    if name.startswith('Sticker Slab | '):
+                        # Price availability is not evidence of metadata origin.
+                        # Reuse the same guarded repair before a memoized ensure.
+                        discover_unpriced_market_item(conn, name, metadata_memo)
                     quote = quote_from_market_price(
                         name,
                         chosen['price'],
                         upstream='csgotrader',
                         source=source,
-                        updated_at=observed_at,
+                        updated_at=source_observed_at,
                         raw={**(chosen.get('raw') or {}), 'chosen_basis': chosen.get('basis')},
                     )
-                    canonical_name = ensure_market_item(conn, quote.get('name')) or quote.get('name')
+                    canonical_name = ensure_market_item(conn, quote.get('name'), metadata_memo=metadata_memo) or quote.get('name')
                     if canonical_name != quote.get('name'):
                         quote = {**quote, 'name': canonical_name}
-                    stored_state = store_market_quote(conn, quote, 'csgotrader:' + source, recalculate=False)
+                    stored_state = store_market_quote(conn, quote, 'csgotrader:' + source,
+                                                      recalculate=False, metadata_memo=metadata_memo,
+                                                      snapshot_replay=content_replayed)
                     valid_names.add(canonical_name)
                     if stored_state:
                         count += 1
                         if stored_state == 'inserted':
                             inserted += 1
                             changed_primary_names.add(canonical_name)
-                            store_csgotrader_history_points(conn, name, raw_price, source, observed_at)
+                            store_csgotrader_history_points(conn, name, raw_price, source, source_observed_at)
                         elif stored_state == 'updated':
                             updated += 1
                             changed_primary_names.add(canonical_name)
-                            store_csgotrader_history_points(conn, name, raw_price, source, observed_at)
+                            store_csgotrader_history_points(conn, name, raw_price, source, source_observed_at)
+                        elif stored_state == 'repaired':
+                            repaired_current += 1
+                            changed_primary_names.add(canonical_name)
                         elif stored_state == 'unchanged':
                             unchanged += 1
                         by_source[source] = by_source.get(source, 0) + 1
-                removed_stale += remove_missing_provider_current_prices(conn, provider_key, valid_names)
-                if progress:
-                    progress(
+                removed_stale += remove_missing_provider_current_prices(
+                    conn, provider_key, valid_names, as_of=source_observed_at if content_replayed else None)
+                save_provider_fetch_receipt(conn, provider_key, source, fetch_metadata,
+                                            received_rows=len(raw), valid_rows=len(valid_names),
+                                            observation_as_of=source_observed_at, content_replayed=content_replayed)
+                if memory_progress:
+                    memory_progress(
                         'provider_stored',
-                        f"Stored {count - before_source_count:,} {CSGOTRADER_SOURCE_LABELS.get(source, source)} current-price rows",
+                        f"Processed {count - before_source_count:,} {CSGOTRADER_SOURCE_LABELS.get(source, source)} current-price rows; commit pending",
                         source=source,
                         stored=count - before_source_count,
                         validNames=len(valid_names),
                     )
+            changed_primary_names.update(metadata_memo.get('catalogChangedNames', ()))
             if changed_primary_names:
                 for changed_name in sorted(changed_primary_names):
                     recalculate_market_item_primary(conn, changed_name)
             timings['storeProviderRowsSeconds'] = round(time.perf_counter() - stage_start, 2)
             stage_start = time.perf_counter()
-            material_changes = inserted + updated + removed_stale
-            if material_changes:
-                cleanup_market_universe(conn)
-                conn.execute("DELETE FROM market_item_lookup")
-                conn.execute("DELETE FROM item_market_metrics WHERE provider='market'")
-                for window in VOLATILITY_DETAIL_WINDOWS:
-                    rebuilt_metrics += rebuild_market_metrics(conn, window)
-                    rebuilt_lookups += rebuild_market_item_lookup(conn, window)
-                conn.execute(
-                    "INSERT OR REPLACE INTO settings(key,value) VALUES('metric_build_version',?)",
-                    (str(METRIC_BUILD_VERSION),),
-                )
-                conn.execute(
-                    "INSERT OR REPLACE INTO settings(key,value) VALUES('lookup_build_version',?)",
-                    (str(LOOKUP_BUILD_VERSION),),
-                )
+            material_changes = inserted + updated + removed_stale + repaired_current
+            catalog_changes = len(metadata_memo.get('catalogChangedNames', ()))
+            needs_derived_rebuild = material_changes or catalog_changes or any(
+                market_cache_state(conn,window)['rebuildRequired'] for window in RESEARCH_METRIC_WINDOWS)
+            if needs_derived_rebuild:
+                if material_changes or catalog_changes:
+                    mark_market_source_changed(conn)
+                    cleanup_market_universe(conn)
+                if bulk_staging_enabled(conn):
+                    bulk_staging_queue_pending(conn)
+                else:
+                    if memory_progress:
+                        memory_progress('rebuilding_metrics', 'Rebuilding every supported research period from shared inputs; commit pending', windowDays=None)
+                    metric_counts = rebuild_market_metric_windows(conn, RESEARCH_METRIC_WINDOWS)
+                    rebuilt_metrics += sum(metric_counts.values())
+                    for window in RESEARCH_METRIC_WINDOWS:
+                        rebuilt_lookups += rebuild_market_item_lookup(conn, window)
+                    conn.execute(
+                        "INSERT OR REPLACE INTO settings(key,value) VALUES('metric_build_version',?)",
+                        (str(METRIC_BUILD_VERSION),),
+                    )
+                    conn.execute(
+                        "INSERT OR REPLACE INTO settings(key,value) VALUES('lookup_build_version',?)",
+                        (str(LOOKUP_BUILD_VERSION),),
+                    )
             timings['rebuildMetricsLookupSeconds'] = round(time.perf_counter() - stage_start, 2)
-    ok = count > 0
+    timings['sourceTransactionSeconds'] = round(time.perf_counter() - source_transaction_started, 3)
+    if BULK_STAGING_HOST is not None:
+        with closing(steam_ask_db()) as stage_probe:
+            staging_selected = bulk_staging_enabled(stage_probe)
+        if staging_selected:
+            if progress:
+                progress('source_transaction_committed', 'Source snapshot committed; derived publication pending', commitState='source_committed_derived_pending', processedRows=count)
+            derived_publication = BULK_STAGING_RUNTIME.request(timings)
+            timings['derivedStagingSeconds'] = derived_publication.get('stagingSeconds')
+            timings['derivedPublicationSeconds'] = derived_publication.get('publicationSeconds')
+    if progress and derived_publication is None:
+        progress('provider_transaction_committed', 'Provider and derived-data transaction committed', processedRows=count)
+    ok = count > 0 or catalog_changes > 0
     steam_history_warm = {'attempted': 0, 'refreshed': 0, 'errors': [], 'enabled': False}
     stage_start = time.perf_counter()
     if ok and warm_history:
@@ -4994,15 +7677,24 @@ def market_universe_bulk_sync_csgotrader(preferred_source=None, warm_history=Fal
             portfolio_id=portfolio_id,
             force=False,
             retry_failures=retry_history_failures,
+            progress=progress,
         )
     timings['warmSteamChartsSeconds'] = round(time.perf_counter() - stage_start, 2)
     stage_start = time.perf_counter()
+    if derived_publication is None:
+        with SQLITE_WRITE_LOCK:
+            with closing(db()) as receipt_conn, receipt_conn:
+                save_market_read_receipt(receipt_conn,'market_status_receipt',_collect_market_universe_status())
     status = market_universe_status()
+    if derived_publication is not None:
+        status = dict(status, derivedPublication=derived_publication,
+                      commitState=derived_publication.get('state','source_committed_derived_pending'))
     timings['statusSeconds'] = round(time.perf_counter() - stage_start, 2)
     timings['totalSeconds'] = round(time.perf_counter() - started, 2)
     return {
         'ok': ok,
         'provider': 'csgotrader',
+        'derivedPublication': derived_publication,
         'preferredSource': 'all',
         'sourcesPulled': sources,
         'itemsSeen': seen,
@@ -5010,10 +7702,25 @@ def market_universe_bulk_sync_csgotrader(preferred_source=None, warm_history=Fal
         'newObservationRows': inserted,
         'updatedObservationRows': updated,
         'unchangedObservationRows': unchanged,
+        'unpricedCatalog': {
+            'newNames': len(metadata_memo.get('catalogNewNames', ())),
+            'changedNames': catalog_changes,
+            'metadataChangeScope': 'all ensured names, including priced metadata-row repairs',
+            'discoveryOutcomes': unpriced_discovery,
+            'nativeBindingUnresolvedReceipts': len(metadata_memo.get('nativeBindingUnresolvedReceipts', ())),
+            'nativeBindingPendingReceipts': len(metadata_memo.get('nativeBindingPendingReceipts', ())),
+            'nativeBindingResolvedReceipts': len(metadata_memo.get('nativeBindingResolvedReceipts', ())),
+            'nativeBindingSemantics': 'legacy quote/history retained; unresolved definitions are not promoted',
+            'outcomeCountSemantics': 'provider rows; the same name may occur in several snapshots',
+            'priceSemantics': 'discovery preserves unknown prices; valid provider-price removal remains unchanged',
+        },
         'removedStaleCurrentRows': removed_stale,
         'rebuiltLookups': rebuilt_lookups,
         'rebuiltMetrics': rebuilt_metrics,
         'bySource': by_source,
+        'replayedSources': replayed_sources,
+        'repairedCurrentRows': repaired_current,
+        'observationPolicy': 'one_capture_per_consecutive_decoded_body_and_ingestion_version',
         'steamHistoryWarm': steam_history_warm,
         'errors': errors,
         'timings': timings,
@@ -5022,8 +7729,12 @@ def market_universe_bulk_sync_csgotrader(preferred_source=None, warm_history=Fal
     }
 
 
-def market_universe_status():
-    with db() as conn:
+def _collect_market_universe_status():
+    """Current/materialized summaries for an explicit refresh task only."""
+    with closing(catalog_read_db()) as conn:
+        conn.execute('BEGIN')
+        source_revision = conn.execute("SELECT value FROM settings WHERE key='market_source_revision'").fetchone()
+        derived_rebuild_required = any(market_cache_state(conn,window)['rebuildRequired'] for window in VOLATILITY_DETAIL_WINDOWS)
         game_catalog_count = conn.execute("SELECT COUNT(*) FROM item_catalog").fetchone()[0]
         provider_marks = ','.join('?' for _ in CURRENT_PRICE_PROVIDERS)
         market_item_count = conn.execute("SELECT COUNT(*) FROM market_items").fetchone()[0]
@@ -5035,7 +7746,7 @@ def market_universe_status():
                            COALESCE(rarity,'') || COALESCE(image,'')) <> ''"""
         ).fetchone()[0]
         quote_count = conn.execute("SELECT COUNT(*) FROM market_items WHERE primary_price IS NOT NULL").fetchone()[0]
-        obs_count = conn.execute("SELECT COUNT(*) FROM price_observations").fetchone()[0]
+        obs_count = None
         observed_items = quote_count
         market_universe_count = max(market_item_count, game_catalog_count, observed_items)
         latest_obs = conn.execute(
@@ -5046,15 +7757,16 @@ def market_universe_status():
             SELECT provider AS source, COUNT(*) AS rows, COUNT(*) AS items,
                    MAX(updated_at) AS latestAt
             FROM market_item_prices
-            WHERE provider IN ({})
             GROUP BY provider
             ORDER BY items DESC, rows DESC
-            LIMIT 12
-        """.format(provider_marks), CURRENT_PRICE_PROVIDERS)]
+        """)]
+        all_provider_price_rows = sum(int(row.get('rows') or 0) for row in source_rows)
+        source_rows = [row for row in source_rows if row['source'] in CURRENT_PRICE_PROVIDERS][:12]
         source_map = {row['source']: row for row in source_rows}
         provider_coverage = []
         for provider in CURRENT_PRICE_PROVIDERS:
             row = source_map.get(provider, {})
+            fetch_receipt = provider_fetch_receipt(conn, provider)
             items = int(row.get('items') or 0)
             latest = int(row.get('latestAt') or 0)
             provider_coverage.append({
@@ -5066,13 +7778,12 @@ def market_universe_status():
                 'coveragePct': round((items / market_universe_count) * 100, 1) if market_universe_count else 0,
                 'latestAt': latest,
                 'ageSeconds': max(0, int(time.time()) - latest) if latest else None,
+                **{key: fetch_receipt.get(key) for key in (
+                    'fetchedAt', 'upstreamSnapshotModifiedAt', 'upstreamLastModified',
+                    'upstreamEtag', 'receivedRows', 'validRows', 'fetchReceiptState',
+                    'upstreamTimeSemantics', 'observationAsOf', 'contentReplayed', 'ingestionVersion')},
             })
-        price_history_rows = conn.execute(
-            "SELECT COUNT(*) FROM price_history WHERE provider='steam' AND price IS NOT NULL"
-        ).fetchone()[0]
-        price_history_items = conn.execute(
-            "SELECT COUNT(DISTINCT name) FROM price_history WHERE provider='steam' AND price IS NOT NULL"
-        ).fetchone()[0]
+        price_history_rows = price_history_items = None
         steam_history_failures = conn.execute(
             """SELECT COUNT(*) FROM steam_history_failures
                WHERE failed_at >= ? AND COALESCE(fetch_version, 0)=?""",
@@ -5096,14 +7807,13 @@ def market_universe_status():
                ORDER BY window_days"""
         )]
         lookup_total = conn.execute("SELECT COUNT(*) FROM market_item_lookup").fetchone()[0]
-        if metric_build_current:
-            for row in metric_rows:
-                row['currentRows'] = int(row.get('rows') or 0)
-        else:
-            for row in metric_rows:
-                row['currentRows'] = 0
-        current_metric_rows = sum(int(r.get('currentRows') or 0) for r in metric_rows)
-        current_metric_items = max((int(r.get('items') or 0) for r in metric_rows), default=0)
+        for row in metric_rows:
+            verified = metric_window_is_current(conn,int(row['window_days']))
+            row['currentRows'] = int(row.get('rows') or 0) if verified else None
+            row['cacheState'] = 'current' if verified else 'stale'
+        verified_metrics = all(row['currentRows'] is not None for row in metric_rows)
+        current_metric_rows = sum(int(row['currentRows']) for row in metric_rows) if verified_metrics else None
+        current_metric_items = max((int(row.get('items') or 0) for row in metric_rows),default=0) if verified_metrics else None
         metric_total_rows = sum(int(r.get('rows') or 0) for r in metric_rows)
         gaps = []
         def add_gap(gap_id, label, missing, total, action, severity='warn'):
@@ -5136,20 +7846,16 @@ def market_universe_status():
             'Refresh catalog metadata, then pull market data again. Provider-only names are also classified locally when possible.',
         )
         add_gap(
-            'steam_history',
-            'Items without raw Steam chart history',
-            max(0, market_universe_count - price_history_items),
-            market_universe_count,
-            'Pull Market Data warms priority portfolio and market chart histories. Remaining charts are filled on demand as groups/items are opened.',
-        )
-        add_gap(
             'metric_windows',
             'Items without current 7d/30d/90d metric rows',
-            max(0, (observed_items * len(VOLATILITY_DETAIL_WINDOWS)) - current_metric_rows),
+            max(0, (observed_items * len(VOLATILITY_DETAIL_WINDOWS)) - current_metric_rows) if current_metric_rows is not None else 0,
             observed_items * len(VOLATILITY_DETAIL_WINDOWS),
-            'Metric rows rebuild automatically after market data is pulled or when a page requests a window.',
+            'Pull Market Data explicitly rebuilds metric rows. Page reads serve saved metrics.',
         )
     return {
+        'sourceRevision':source_revision['value'] if source_revision else None,
+        'derivedRebuildRequired':derived_rebuild_required,
+        'countsAsOf':int(time.time()),'countState':'saved_current_summary_history_not_counted',
         'catalogItems': market_universe_count,
         'marketItems': market_universe_count,
         'gameCatalogItems': game_catalog_count,
@@ -5171,6 +7877,7 @@ def market_universe_status():
             'catalogItems': game_catalog_count,
             'marketItems': market_item_count,
             'providerPriceRows': sum(int(r.get('rows') or 0) for r in source_rows),
+            'allProviderPriceRows': all_provider_price_rows,
             'providerObservationRows': obs_count,
             'steamHistoryRows': price_history_rows,
             'steamHistoryItems': price_history_items,
@@ -5209,25 +7916,137 @@ def market_universe_status():
     }
 
 
+def project_refresh_status(status, current_revision=None):
+    """Fields consumed by the status poll; manual tasks use /api/data-tasks."""
+    def pick(value, fields):
+        value = value or {}
+        return {key: value[key] for key in fields if key in value}
+    result = pick(status, ('catalogItems', 'observedItems', 'observationRows', 'latestObservationAt',
+        'steamCookieConfigured', 'sourceRevision', 'countState', 'countsAsOf',
+        'dataState', 'cacheState', 'rebuildRequired', 'autoRefreshStatus'))
+    result.update(projection='refresh-status-v1', currentSourceRevision=current_revision)
+    result['derivedPublication'] = pick(status.get('derivedPublication'), ('state','derivedCurrent',
+        'publishedGeneration','asOf','workerRunning','paused','stopping','sourceTransactionSeconds',
+        'stagingSeconds','publicationSeconds','lastCycleSeconds'))
+    result['derivedCountsAsOf'] = status.get('derivedCountsAsOf')
+    result['sourceCountsCurrent'] = status.get('sourceCountsCurrent')
+    result['freshness'] = pick(status.get('freshness'), ('sourceAsOf', 'countsAsOf', 'currentness'))
+    result['stores'] = pick(status.get('stores'), ('providerPriceRows', 'currentMetricRows',
+        'steamHistoryItems', 'steamHistoryRows', 'steamHistoryRecentFailures', 'lookupRows'))
+    result['metrics'] = pick(status.get('metrics'), ('rows',))
+    result['lookup'] = pick(status.get('lookup'), ('rows',))
+    result['dataset'] = pick(status.get('dataset'), ('id', 'source', 'asOf'))
+    result['refreshPlan'] = pick(status.get('refreshPlan'), ('autoRefreshEnabled', 'automaticRefreshHours'))
+    result['sources'] = [pick(row, ('source', 'items', 'rows', 'latestAt')) for row in (status.get('sources') or [])[:8]]
+    result['providerCoverage'] = [pick(row, ('id', 'label', 'items', 'rows', 'latestAt', 'coveragePct',
+        'fetchedAt', 'fetchedAgeSeconds', 'upstreamSnapshotModifiedAt', 'upstreamSnapshotAgeSeconds',
+        'upstreamLastModified', 'upstreamEtag', 'receivedRows', 'validRows', 'fetchReceiptState',
+        'upstreamTimeSemantics', 'observationAsOf', 'contentReplayed', 'ingestionVersion'))
+                                  for row in status.get('providerCoverage') or []]
+    result['gaps'] = [pick(row, ('severity', 'label', 'action', 'missing', 'coveragePct'))
+                      for row in (status.get('gaps') or [])[:6]]
+    return result
+
+
+def market_universe_status(projection=None):
+    """Serve a persisted small summary; never aggregate raw history on a GET."""
+    with closing(catalog_read_db()) as conn:
+        conn.execute('BEGIN')
+        receipt = market_read_receipt(conn,'market_status_receipt')
+        row = conn.execute("SELECT value FROM settings WHERE key='market_source_revision'").fetchone()
+        generation_status = getattr(conn, '_derived_generation_status', None)
+        if generation_status and generation_status != 'legacy_canonical':
+            metadata = getattr(conn, '_derived_generation_metadata', {})
+            derived_state = {'current': generation_status == 'current_generation'}
+            current_counts = derived_state['current']
+            counts = metadata.get('counts', {})
+            derived_view = {
+                'derivedPublication': {'state': generation_status,
+                    'derivedCurrent': current_counts,
+                    'publishedGeneration': getattr(conn, '_derived_generation', None),
+                    'asOf': metadata.get('asOf')},
+                'derivedCountsAsOf': metadata.get('asOf'),
+                'derivedRebuildRequired': not current_counts,
+                'metrics': {'rows': counts.get('item_market_metrics')},
+                'lookup': {'rows': counts.get('market_item_lookup')},
+                'stores': {'metricRows': counts.get('item_market_metrics'),
+                    'currentMetricRows': counts.get('item_market_metrics') if current_counts else None,
+                    'lookupRows': counts.get('market_item_lookup')},
+            }
+        else:
+            derived_state = bulk_derived_staging.published_state(conn, BULK_STAGING_HOST.engine.external) if bulk_staging_enabled(conn) else None
+            derived_view = BULK_STAGING_RUNTIME.decorate_saved(conn, receipt) if derived_state is not None else None
+    current = bool(receipt and row and receipt.get('sourceRevision')==row['value'])
+    if derived_state is not None:
+        current = current and derived_state['current']
+    if not receipt:
+        receipt = {key:None for key in ('catalogItems','marketItems','gameCatalogItems','catalogMatchedItems',
+            'metadataCoveragePct','quotedItems','observedItems','observationRows','latestObservationAt','coveragePct')}
+        receipt.update({'sources':[],'providerCoverage':[],'gaps':[],
+            'stores':{key:None for key in ('catalogItems','marketItems','providerPriceRows','allProviderPriceRows','providerObservationRows',
+                'steamHistoryRows','steamHistoryItems','steamHistoryRecentFailures','metricRows','currentMetricRows','metricItems','lookupRows')},
+            'metrics':{'buildVersion':METRIC_BUILD_VERSION,'items':None,'rows':None,'windows':[]},
+            'lookup':{'buildVersion':LOOKUP_BUILD_VERSION,'rows':None,'windows':[]},
+            'dataset':{'id':'market-items:unprepared','source':'saved market data','asOf':None,'observedItems':None,'observationRows':None},
+            'countState':'not_counted','countsAsOf':None})
+    if derived_view is not None:
+        receipt = dict(receipt)
+        for key in ('derivedPublication','derivedCountsAsOf','derivedRebuildRequired'):
+            if key in derived_view:
+                receipt[key] = derived_view[key]
+        for key in ('metrics','lookup','stores'):
+            if key in derived_view:
+                receipt[key] = {**receipt.get(key,{}), **derived_view[key]}
+    now = int(time.time())
+    for provider in receipt.get('providerCoverage') or []:
+        latest = provider.get('latestAt')
+        provider['ageSeconds'] = max(0,now-int(latest)) if latest else None
+        fetched = provider.get('fetchedAt')
+        modified = provider.get('upstreamSnapshotModifiedAt')
+        provider['fetchedAgeSeconds'] = max(0, now-int(fetched)) if fetched is not None else None
+        provider['upstreamSnapshotAgeSeconds'] = max(0, now-int(modified)) if modified is not None else None
+    compact = projection == 'refresh-status-v1'
+    if derived_state is not None:
+        receipt = dict(receipt, derivedPublication=(derived_view or {}).get('derivedPublication',derived_state))
+    result = {**receipt,'bulkProvider':'csgotrader','bulkConfigured':True,
+        'bulkProviders':configured_bulk_providers(),'steamCookieConfigured':bool(steam_cookie_header()),
+        'tasks':None if compact else data_task_snapshot(),'autoRefreshStatus':automatic_refresh_snapshot(),'dataState':'saved','cacheState':'current' if current else ('stale' if receipt.get('countsAsOf') else 'missing'),
+        'rebuildRequired':(not derived_state['current']) if derived_state is not None else (not current or receipt.get('derivedRebuildRequired',True)),
+        'sourceCountsCurrent':bool(receipt and row and receipt.get('sourceRevision')==row['value']),
+        'freshness':{'sourceAsOf':receipt.get('latestObservationAt'),'countsAsOf':receipt.get('countsAsOf'),
+                     'currentness':'matched_writer_revision' if current else 'unverified_saved_receipt'},
+        'refreshPlan':{'primaryAction':'Pull Market Data','description':'Explicit tasks refresh provider data and saved metrics; viewing does not start work.',
+                       'automaticRefreshHours':round(MARKET_REFRESH_INTERVAL_SECONDS/3600,1),'autoRefreshEnabled':AUTO_MARKET_REFRESH}}
+
+    if compact:
+        return project_refresh_status(result, row['value'] if row else None)
+    return result
+
+
+def application_status():
+    status = market_universe_status()
+    stores = status.get('stores') or {}
+    with closing(catalog_read_db()) as conn:
+        conn.execute('BEGIN')
+        snaps = conn.execute('SELECT COUNT(*) FROM snapshots').fetchone()[0]
+        portfolios = conn.execute('SELECT COUNT(*) FROM portfolios').fetchone()[0]
+    return {'ok':True,'snaps':snaps,'portfolios':portfolios,
+        'catalog':stores.get('catalogItems'),'marketItems':stores.get('marketItems'),'prices':stores.get('allProviderPriceRows'),
+        'priceHistoryRows':None,'priceObservationRows':None,'sharedPriceRows':None,'sharedPriceHistoryRows':None,
+        'sharedPriceObservationRows':None,'indexedRows':None,'portfolioItems':None,
+        'countState':status.get('countState'),'historyCountState':'not_counted','freshness':status.get('freshness'),
+        'dataState':'saved','cacheState':status.get('cacheState'),'rebuildRequired':status.get('rebuildRequired'),
+        'data_dir':DATA_DIR,'database':DB_FILE}
+
+
 def shared_pricing_status():
-    with db() as conn:
-        lanes = [dict(r) for r in conn.execute(
-            """SELECT lane, COUNT(*) AS items, MAX(updated_at) AS latestAt
-               FROM shared_item_prices
-               GROUP BY lane
-               ORDER BY lane"""
-        )]
-        return {
-            'ok': True,
-            'db': DB_FILE,
-            'lanes': lanes,
-            'items': conn.execute("SELECT COUNT(DISTINCT name) FROM shared_item_prices").fetchone()[0],
-            'currentRows': conn.execute("SELECT COUNT(*) FROM shared_item_prices").fetchone()[0],
-            'observationRows': conn.execute("SELECT COUNT(*) FROM shared_price_observations").fetchone()[0],
-            'historyRows': conn.execute("SELECT COUNT(*) FROM shared_price_history").fetchone()[0],
-            'sourceQuoteRows': conn.execute("SELECT COUNT(*) FROM shared_source_quotes").fetchone()[0],
-            'latestAt': max((int(r.get('latestAt') or 0) for r in lanes), default=0),
-        }
+    with closing(catalog_read_db()) as conn:
+        receipt = market_read_receipt(conn,'shared_status_receipt')
+    return {'ok':True,'db':DB_FILE,'lanes':(receipt or {}).get('lanes',[]),
+        'items':(receipt or {}).get('items'),'currentRows':(receipt or {}).get('currentRows'),
+        'observationRows':None,'historyRows':None,'sourceQuoteRows':(receipt or {}).get('sourceQuoteRows'),
+        'latestAt':(receipt or {}).get('latestAt'),'dataState':'saved','cacheState':'cached' if receipt else 'missing',
+        'countState':'saved_receipt' if receipt else 'not_counted','historyCountState':'not_counted'}
 
 
 def shared_item_pricing(name, history_limit=500):
@@ -5410,11 +8229,47 @@ def compact_market_item_row(row):
     return compact
 
 
+def project_market_item_response(response, projection=''):
+    """Opt-in table DTO; preserve the legacy response for every other value."""
+    if projection != 'market-table-v1':
+        return response
+    item_fields = (
+        'name', 'marketHashName', 'kind', 'type', 'weapon', 'collection', 'rarity',
+        'latestPrice', 'steamPrice', 'priceBasis', 'confidencePct', 'providerPrices',
+        'realWorldPrice', 'realWorldProvider', 'realWorldProviderLabel',
+        'steamPremiumPct', 'steamPremiumDollar', 'providerDivergencePct',
+        'divergentProvider', 'divergentProviderLabel', 'priorPrice', 'changePct',
+        'changeDollar', 'volatilityWindows', 'volume', 'latestAt', 'source', 'groups',
+    )
+    provider_fields = ('price', 'solidPrice', 'label', 'basis', 'updatedAt')
+    window_fields = ('volatilityPct', 'trendPct', 'isPartialWindow',
+                     'windowCoveragePct', 'metricBasis', 'metricState')
+
+    def fields(value, names):
+        # Preserve null/missing objects and null field values without inventing data.
+        return {key: value[key] for key in names if key in value} if isinstance(value, dict) else value
+
+    def objects(value, names):
+        return {key: fields(row, names) for key, row in value.items()} if isinstance(value, dict) else value
+
+    items = []
+    for row in response['items']:
+        item = fields(row, item_fields)
+        if 'providerPrices' in item:
+            item['providerPrices'] = objects(item['providerPrices'], provider_fields)
+        if 'volatilityWindows' in item:
+            item['volatilityWindows'] = objects(item['volatilityWindows'], window_fields)
+        items.append(item)
+    return {**response, 'items': items, 'projection': 'market-table-v1'}
+
+
 def run_data_accumulation_task(task_id, options):
     global ACTIVE_DATA_TASK_ID
     mode = (options.get('mode') or 'accumulate_missing').strip().lower()
     pull_mode = (options.get('pullMode') or 'gentle').strip().lower()
     portfolio_id = options.get('portfolio') or None
+    history_scope = str(options.get('historyScope') or 'mixed').strip().lower()
+    history_all = options.get('historyAll') is True
     force = bool(options.get('force'))
     retry_failures = bool(options.get('retryFailures', True))
     history_limit = parse_int_param(options.get('historyLimit'), 40 if pull_mode == 'gentle' else 120, minimum=0, maximum=500)
@@ -5422,7 +8277,111 @@ def run_data_accumulation_task(task_id, options):
     sleep_seconds = parse_int_param(options.get('sleepSeconds'), 3 if pull_mode == 'gentle' else 1, minimum=0, maximum=120)
 
     def progress(stage, message, **payload):
+        with DATA_TASK_LOCK:
+            state = (DATA_TASKS.get(task_id) or {}).get('status')
+        if state in ('paused', 'cancelled') and stage != state:
+            return
         data_task_event(task_id, stage, message, **payload)
+
+    def transaction_progress(stage, message, **payload):
+        _record_data_task_event(task_id, stage, message, payload, defer_persistence=True)
+
+    progress._memory_only_callback = transaction_progress
+
+    def stop_if_requested():
+        with DATA_TASK_LOCK:
+            task = DATA_TASKS[task_id]
+            control = (task.get('options') or {}).get('_control')
+            state = 'queued' if DATA_TASK_STOP_EVENT.is_set() else control
+            if state not in ('paused', 'cancelled', 'queued'):
+                return True
+            task.update(status=state, updatedAt=int(time.time()))
+            if state == 'cancelled':
+                task['finishedAt'] = int(time.time())
+            else:
+                task.pop('finishedAt', None)
+        progress('interrupted' if state == 'queued' else state,
+                 'Server stopping; explicit task checkpoint remains saved.' if state == 'queued' else 'Explicit data task ' + state + '.')
+        return False
+
+    def pause_provider(message):
+        with DATA_TASK_LOCK:
+            task = DATA_TASKS[task_id]
+            task.update(status='paused', updatedAt=int(time.time()))
+            task.setdefault('options', {})['_control'] = 'paused'
+            task.pop('finishedAt', None)
+        progress('paused', message)
+        return False
+
+    def wait_for_provider(history=None):
+        if not stop_if_requested():
+            return False
+        if history is None:
+            return True
+        if history.get('operatorPaused'):
+            return pause_provider('Steam acquisition is operator-paused; the same explicit task remains saved.')
+        retry_at = history.get('retryAt')
+        now = DATA_TASK_CLOCK()
+        if type(retry_at) is not int or retry_at <= now:
+            return False  # No valid future deadline: no premature or busy retry.
+        with DATA_TASK_LOCK:
+            task = DATA_TASKS[task_id]
+            task.update(status='waiting', updatedAt=int(time.time()))
+        progress('waiting_provider', 'Waiting for the saved shared Steam admission deadline; this job will continue automatically.', retryAt=retry_at, reason=history.get('reason'))
+        while True:
+            DATA_TASK_WAKE.clear()
+            if not stop_if_requested():
+                return False
+            pipeline = globals().get('PRICE_PIPELINE')
+            if pipeline:
+                source = next(row for row in pipeline.book.providers() if row['id'] == 'steam')
+                if not source['enabled']:
+                    return pause_provider('Steam acquisition was paused while this explicit task waited.')
+            remaining = retry_at - DATA_TASK_CLOCK()
+            if remaining <= 0:
+                with DATA_TASK_LOCK:
+                    DATA_TASKS[task_id]['status'] = 'running'
+                progress('provider_resumed', 'Saved Steam deadline reached; retrying the same bounded item.', retryAt=retry_at)
+                return True
+            with DATA_TASK_LOCK:
+                options_saved = DATA_TASKS[task_id].setdefault('options', {})
+                used = max(0, _finite_float(options_saved.get('_providerWaitSeconds')) or 0)
+            if used >= DATA_TASK_MAX_WAIT_SECONDS:
+                return pause_provider('The explicit task reached its 24-hour provider-wait budget; its checkpoint remains saved for owner resume.')
+            duration = min(60, remaining, DATA_TASK_MAX_WAIT_SECONDS - used)
+            before = DATA_TASK_CLOCK()
+            DATA_TASK_WAKE.wait(duration)
+            elapsed = max(0, DATA_TASK_CLOCK() - before)
+            with DATA_TASK_LOCK:
+                DATA_TASKS[task_id].setdefault('options', {})['_providerWaitSeconds'] = used + elapsed
+
+    progress._wait_for_provider = wait_for_provider
+
+    def pending(result, stage, message):
+        with DATA_TASK_LOCK:
+            task = DATA_TASKS[task_id]
+            task.update(status='pending', stage=stage, updatedAt=int(time.time()),
+                        result=_data_task_result_summary(result), error=None)
+            task.pop('finishedAt', None)
+        progress(stage, message, result=_data_task_result_summary(result))
+
+    def check_history(outcome):
+        if not isinstance(outcome, dict):
+            return False
+        if outcome.get('governorDeferred') or outcome.get('rateLimited'):
+            if outcome.get('historyAttemptCapReached'):
+                raise RuntimeError('The bounded Steam history HTTP-attempt budget was exhausted; saved observations are retained.')
+            if not stop_if_requested():
+                return True
+            pending(outcome, 'waiting_provider', 'History work remains pending at the shared provider deadline; saved observations remain available.')
+            return True
+        if outcome.get('failed'):
+            detail = (outcome.get('errors') or [{}])[0].get('error') or 'Steam chart acquisition did not return genuine observations'
+            raise RuntimeError(detail)
+        for value in outcome.values():
+            if isinstance(value, dict) and check_history(value):
+                return True
+        return False
 
     with DATA_TASK_LOCK:
         task = DATA_TASKS[task_id]
@@ -5430,9 +8389,17 @@ def run_data_accumulation_task(task_id, options):
         task['startedAt'] = int(time.time())
         task['updatedAt'] = task['startedAt']
     try:
+        if mode not in ('provider_snapshots', 'full_pull', 'accumulate_missing', 'steam_history'):
+            raise ValueError('Unsupported explicit data-task mode')
+        if history_scope not in ('mixed', 'portfolio') or (history_scope == 'portfolio' and not portfolio_id):
+            raise ValueError('Portfolio history scope requires a selected portfolio')
+        if history_all and (history_scope != 'portfolio' or mode != 'steam_history'):
+            raise ValueError('All-holdings history requires a portfolio-scoped history task')
         progress('started', f"Started {mode.replace('_', ' ')} using {pull_mode} pull mode", mode=mode, pullMode=pull_mode, historyLimit=history_limit, cycles=cycles)
         result = None
         for cycle in range(1, cycles + 1):
+            if not stop_if_requested():
+                return
             progress('cycle', f"Cycle {cycle}/{cycles}", cycle=cycle, cycles=cycles)
             if mode in ('provider_snapshots', 'full_pull', 'accumulate_missing'):
                 progress('provider_sync', 'Refreshing CSGO Trader provider snapshots')
@@ -5445,6 +8412,21 @@ def run_data_accumulation_task(task_id, options):
                     retry_history_failures=retry_failures,
                     progress=progress,
                 )
+                if not stop_if_requested():
+                    with DATA_TASK_LOCK:
+                        DATA_TASKS[task_id]['result'] = _data_task_result_summary(result)
+                    return
+                if not isinstance(result, dict) or result.get('ok') is False:
+                    with DATA_TASK_LOCK:
+                        DATA_TASKS[task_id]['result'] = _data_task_result_summary(result)
+                    raise RuntimeError(result.get('error') or 'Provider acquisition did not complete' if isinstance(result, dict) else 'Invalid provider result')
+                derived = result.get('derivedPublication') or (result.get('status') or {}).get('derivedPublication') or {}
+                commit_state = (result.get('status') or {}).get('commitState')
+                if derived.get('complete') is False or commit_state == 'source_committed_derived_pending':
+                    pending(result, 'derived_pending', 'Source data committed; derived publication remains pending and has not been reported complete.')
+                    return
+                if check_history(result.get('steamHistoryWarm')):
+                    return
                 progress(
                     'provider_complete',
                     f"Provider sync checked {int(result.get('itemsStored') or 0):,} rows; new {int(result.get('newObservationRows') or 0):,}, updated {int(result.get('updatedObservationRows') or 0):,}",
@@ -5454,24 +8436,40 @@ def run_data_accumulation_task(task_id, options):
                     unchangedRows=result.get('unchangedObservationRows'),
                     bySource=result.get('bySource') or {},
                 )
-            if mode in ('steam_history', 'accumulate_missing'):
+            if mode in ('steam_history', 'accumulate_missing') and history_limit:
                 if portfolio_id:
-                    portfolio_limit = max(1, history_limit // 2)
+                    portfolio_limit = min(250, history_limit) if history_scope == 'portfolio' else max(1, history_limit // 2)
                     progress('portfolio_history', f"Warming up to {portfolio_limit:,} missing portfolio Steam charts", limit=portfolio_limit)
-                    portfolio_result = refresh_steam_history_for_chart_items(
-                        latest_portfolio_history_candidates(max(portfolio_limit * 8, 80), portfolio_id=portfolio_id),
-                        limit=portfolio_limit,
-                        force=force,
-                        retry_failures=retry_failures,
-                        progress=progress,
-                        stage_prefix='portfolio_history',
-                    )
+                    candidates = (latest_portfolio_history_candidates(10000, portfolio_id=portfolio_id, all_items=True)
+                                  if history_all else latest_portfolio_history_candidates(
+                                      max(portfolio_limit * 8, 80), portfolio_id=portfolio_id))
+                    batches = [candidates[offset:offset + portfolio_limit]
+                               for offset in range(0, len(candidates), portfolio_limit)] if history_all else [candidates]
+                    portfolio_result = {'attempted': 0, 'refreshed': 0, 'failed': 0, 'cachedFallback': 0, 'errors': []}
+                    for batch_number, batch in enumerate(batches, 1):
+                        if not stop_if_requested():
+                            return
+                        if history_all:
+                            progress('portfolio_batch', f"Selected portfolio batch {batch_number}/{len(batches)}",
+                                     batch=batch_number, batches=len(batches), selectedItems=len(candidates))
+                        batch_result = refresh_steam_history_for_chart_items(
+                            batch, limit=portfolio_limit, force=False if history_all else force,
+                            retry_failures=retry_failures, progress=progress, stage_prefix='portfolio_history')
+                        for key in ('attempted', 'refreshed', 'failed', 'cachedFallback'):
+                            portfolio_result[key] += int(batch_result.get(key) or 0)
+                        portfolio_result['errors'] = (portfolio_result['errors'] + list(batch_result.get('errors') or []))[:50]
+                        if check_history(batch_result):
+                            return
+                    if history_scope == 'portfolio':
+                        result = {'ok': True, 'historyScope': 'portfolio',
+                                  'selectedItems': len(candidates) if history_all else min(portfolio_limit, len(candidates)),
+                                  'historyAll': history_all, 'portfolioHistory': portfolio_result}
                     progress(
                         'portfolio_history_complete',
                         f"Portfolio Steam charts cached {int(portfolio_result.get('refreshed') or 0):,}/{int(portfolio_result.get('attempted') or 0):,}",
                         **portfolio_result,
                     )
-                    market_limit = max(0, history_limit - portfolio_limit)
+                    market_limit = 0 if history_scope == 'portfolio' else max(0, history_limit - portfolio_limit)
                 else:
                     market_limit = history_limit
                 if market_limit:
@@ -5484,15 +8482,20 @@ def run_data_accumulation_task(task_id, options):
                         progress=progress,
                         stage_prefix='market_history',
                     )
+                    if check_history(market_result):
+                        return
                     progress(
                         'market_history_complete',
                         f"Market Steam charts cached {int(market_result.get('refreshed') or 0):,}/{int(market_result.get('attempted') or 0):,}",
                         **market_result,
                     )
             status = market_universe_status()
+            steam_history_count = (status.get('stores') or {}).get('steamHistoryItems')
+            steam_history_summary = (f"{int(steam_history_count):,} items with raw Steam charts"
+                                     if steam_history_count is not None else 'saved Steam chart count not measured')
             progress(
                 'coverage',
-                f"Coverage now {status.get('coveragePct', 0)}% priced, {int((status.get('stores') or {}).get('steamHistoryItems') or 0):,} items with raw Steam charts",
+                f"Coverage now {status.get('coveragePct', 0)}% priced, {steam_history_summary}",
                 coveragePct=status.get('coveragePct'),
                 observedItems=status.get('observedItems'),
                 catalogItems=status.get('catalogItems'),
@@ -5500,14 +8503,17 @@ def run_data_accumulation_task(task_id, options):
                 gaps=status.get('gaps') or [],
             )
             if cycle < cycles and sleep_seconds:
-                time.sleep(sleep_seconds)
+                DATA_TASK_WAKE.wait(sleep_seconds)
+        if not stop_if_requested():
+            return
         with DATA_TASK_LOCK:
             task = DATA_TASKS[task_id]
-            task['status'] = 'complete'
+            partial = bool(isinstance(result, dict) and result.get('errors'))
+            task['status'] = 'partial' if partial else 'complete'
             task['finishedAt'] = int(time.time())
             task['updatedAt'] = task['finishedAt']
             task['result'] = _data_task_result_summary(result or {'ok': True})
-        progress('complete', 'Data task complete')
+        progress('partial' if partial else 'complete', 'Data task finished with provider errors; requested coverage remains incomplete.' if partial else 'Data task complete')
     except Exception as exc:
         with DATA_TASK_LOCK:
             task = DATA_TASKS.get(task_id)
@@ -5519,12 +8525,55 @@ def run_data_accumulation_task(task_id, options):
         progress('error', f"Data task failed: {exc}", error=str(exc))
     finally:
         with DATA_TASK_LOCK:
+            DATA_TASK_WORKERS.pop(task_id, None)
             if ACTIVE_DATA_TASK_ID == task_id:
                 ACTIVE_DATA_TASK_ID = None
 
 
 def start_data_task(options):
     global ACTIVE_DATA_TASK_ID
+    if not isinstance(options, dict):
+        return {'ok': False, 'error': 'One data-task object is required'}
+    action = options.get('action')
+    if action in ('pause', 'cancel', 'resume'):
+        task_id = options.get('taskId') or options.get('task_id')
+        with DATA_TASK_LOCK:
+            task = DATA_TASKS.get(task_id)
+            if not task:
+                return {'ok': False, 'error': 'Saved data task not found'}
+            if action != 'resume':
+                if task.get('status') in ('complete', 'cancelled'):
+                    return {'ok': False, 'error': 'Task is already terminal', 'task': compact_data_task(task)}
+                state = 'paused' if action == 'pause' else 'cancelled'
+                task.setdefault('options', {})['_control'] = state
+                task.update(status=state, updatedAt=int(time.time()))
+                if state == 'cancelled':
+                    task['finishedAt'] = int(time.time())
+                DATA_TASK_WAKE.set()
+            else:
+                worker = DATA_TASK_WORKERS.get(task_id)
+                if worker and callable(getattr(worker, 'is_alive', None)) and worker.is_alive():
+                    return {'ok': False, 'error': 'The previous task worker is still closing; resume after its saved boundary', 'task': compact_data_task(task)}
+                if task.get('status') not in ('paused', 'pending', 'error', 'queued', 'partial'):
+                    return {'ok': False, 'error': 'This task is not resumable', 'task': compact_data_task(task)}
+                if latest_data_task_active():
+                    return {'ok': False, 'error': 'Another explicit task is active'}
+                task.setdefault('options', {}).pop('_control', None)
+                task['options']['_providerWaitSeconds'] = 0
+                task.update(status='queued', stage='queued', updatedAt=int(time.time()))
+                task.pop('finishedAt', None)
+                options = dict(task['options'])
+                ACTIVE_DATA_TASK_ID = task_id
+        data_task_event(task_id, task['status'], 'Explicit data task ' + action + ' requested.')
+        if action != 'resume':
+            return {'ok': True, 'task': compact_data_task(task)}
+        thread = threading.Thread(target=run_data_accumulation_task, args=(task_id, options), name=f'data-task-{task_id}', daemon=True)
+        with DATA_TASK_LOCK:
+            DATA_TASK_WORKERS[task_id] = thread
+        thread.start()
+        return {'ok': True, 'task': compact_data_task(task)}
+    if DATA_TASK_STOP_EVENT.is_set():
+        return {'ok': False, 'error': 'Server is stopping; no new source task admitted'}
     if latest_data_task_active():
         snapshot = data_task_snapshot()
         snapshot.update({'ok': False, 'error': 'A data task is already running.'})
@@ -5549,10 +8598,25 @@ def start_data_task(options):
         ACTIVE_DATA_TASK_ID = task_id
     data_task_event(task_id, 'queued', f"Queued {task['name']}", **task['options'])
     thread = threading.Thread(target=run_data_accumulation_task, args=(task_id, options), name=f"data-task-{task_id}", daemon=True)
+    with DATA_TASK_LOCK:
+        DATA_TASK_WORKERS[task_id] = thread
     thread.start()
     snapshot = data_task_snapshot()
     snapshot.update({'ok': True, 'task': compact_data_task(task)})
     return snapshot
+
+
+def stop_data_tasks(timeout=40):
+    """Wake explicit provider waits and close workers at their unit boundary."""
+    DATA_TASK_STOP_EVENT.set()
+    DATA_TASK_WAKE.set()
+    deadline = time.monotonic() + max(0, float(timeout))
+    with DATA_TASK_LOCK:
+        workers = list(DATA_TASK_WORKERS.values())
+    for worker in workers:
+        if worker is not threading.current_thread() and callable(getattr(worker, 'join', None)):
+            worker.join(max(0, deadline - time.monotonic()))
+    return all(not worker.is_alive() for worker in workers)
 
 
 def market_item_metric_windows(conn, rows, windows=VOLATILITY_DETAIL_WINDOWS):
@@ -5636,20 +8700,8 @@ def average_volatility_windows(items, require_full=True):
 
 
 def market_item_lookup_filter_options(conn, window_days):
-    rows = [dict(r) for r in conn.execute(
-        """SELECT DISTINCT collection, item_type AS type, weapon, kind, rarity
-           FROM market_item_lookup
-           WHERE window_days=?""",
-        (window_days,),
-    )]
-    collections = sorted({r.get('collection') for r in rows if r.get('collection')})
-    types = sorted({
-        r.get('type') or r.get('weapon') or r.get('kind')
-        for r in rows
-        if r.get('type') or r.get('weapon') or r.get('kind')
-    })
-    grades = sorted({r.get('rarity') for r in rows if r.get('rarity')})
-    return {'collections': collections, 'types': types, 'grades': grades}
+    receipt = market_read_receipt(conn,'market_lookup_receipt:'+str(window_days))
+    return receipt.get('filters',{}) if receipt else {'collections':[],'types':[],'grades':[],'available':False}
 
 
 def split_filter_terms(value):
@@ -5667,20 +8719,26 @@ def split_filter_terms(value):
 
 def resolve_market_metric_window(conn, requested):
     requested = parse_int_param(requested, 90, allowed=VOLATILITY_WINDOWS)
-    rows = [dict(r) for r in conn.execute(
-        """SELECT window_days, COUNT(*) AS n
-           FROM item_market_metrics
-           WHERE provider='market'
-           GROUP BY window_days"""
-    )]
-    rows = [r for r in rows if int(r.get('n') or 0) > 0]
+    # Exact requested windows need no probes of unrelated saved windows.
+    # Prefer genuine all-history metrics for zero; older caches without that
+    # projection retain the explicitly labelled largest-window fallback.
+    if conn.execute(
+            "SELECT 1 FROM item_market_metrics WHERE provider='market' AND window_days=? LIMIT 1",
+            (requested,)).fetchone():
+        receipt = market_read_receipt(conn,'market_metric_receipt:'+str(requested))
+        return requested, True, receipt.get('rows') if receipt else None
+    rows = []
+    for window in sorted(VOLATILITY_WINDOWS):
+        if conn.execute("SELECT 1 FROM item_market_metrics WHERE provider='market' AND window_days=? LIMIT 1",(window,)).fetchone():
+            receipt = market_read_receipt(conn,'market_metric_receipt:'+str(window))
+            rows.append({'window_days':window,'n':receipt.get('rows') if receipt else None})
     if not rows:
         return requested, False, 0
     if requested == 0:
         chosen = max(rows, key=lambda r: int(r['window_days'] or 0))
     else:
         chosen = min(rows, key=lambda r: abs(int(r['window_days'] or 0) - requested))
-    return int(chosen['window_days'] or 0), int(chosen['window_days'] or 0) == requested, int(chosen['n'] or 0)
+    return int(chosen['window_days'] or 0), int(chosen['window_days'] or 0) == requested, chosen['n']
 
 
 def parse_float_param(value):
@@ -5692,38 +8750,145 @@ def parse_float_param(value):
 
 
 def market_item_lookup_is_current(conn, window_days):
-    version = conn.execute("SELECT value FROM settings WHERE key='lookup_build_version'").fetchone()
-    if not version or str(version['value']) != str(LOOKUP_BUILD_VERSION):
-        return False
-    metric_version = conn.execute("SELECT value FROM settings WHERE key='metric_build_version'").fetchone()
-    if not metric_version or str(metric_version['value']) != str(METRIC_BUILD_VERSION):
-        return False
-    cache = conn.execute(
-        "SELECT COUNT(*) AS n, MAX(metric_updated_at) AS updated_at FROM market_item_lookup WHERE window_days=?",
-        (window_days,),
-    ).fetchone()
-    metrics = conn.execute(
-        """SELECT COUNT(*) AS n, MAX(updated_at) AS updated_at
-           FROM item_market_metrics
-           WHERE provider='market' AND window_days=?""",
-        (window_days,),
-    ).fetchone()
-    provider_marks = ','.join('?' for _ in CURRENT_PRICE_PROVIDERS)
-    prices = conn.execute(
-        f"SELECT MAX(updated_at) AS updated_at FROM market_item_prices WHERE provider IN ({provider_marks})",
-        CURRENT_PRICE_PROVIDERS,
-    ).fetchone()
-    if not metrics or int(metrics['n'] or 0) == 0:
-        return False
-    price_updated_at = int(prices['updated_at'] or 0) if prices else 0
-    source_updated_at = max(int(metrics['updated_at'] or 0), price_updated_at)
-    return (
-        int(cache['n'] or 0) == int(metrics['n'] or 0)
-        and int(cache['updated_at'] or 0) >= source_updated_at
-    )
+    return market_cache_state(conn,window_days)['cacheState']=='current'
+
+
+def build_unpriced_market_lookup_rows(conn, window_days, max_rows=5000, missing_only=True,
+                                     after_name=None, allow_more=False, return_batch=False):
+    """Bounded metadata projection for explicit writes, never called by a GET.
+
+    The caller owns the transaction and SQLite progress/time/storage budgets.
+    Current quotes are tested only through name/provider keys. No history is read.
+    """
+    if type(max_rows) is not int or not 1 <= max_rows <= 5000:
+        raise ValueError('Unpriced projection row cap must be between 1 and 5000')
+    if window_days not in VOLATILITY_WINDOWS:
+        raise ValueError('Unsupported lookup window')
+    def positive(value):
+        value = _finite_float(value)
+        return value if value is not None and value > 0 else None
+    missing_sql = ("NOT EXISTS (SELECT 1 FROM market_item_lookup l "
+                   "WHERE l.window_days=? AND l.name=m.name)") if missing_only else (
+                   "NOT EXISTS (SELECT 1 FROM item_market_metrics im WHERE im.provider='market' "
+                   "AND im.window_days=? AND im.name=m.name)")
+    cursor_sql = 'AND m.name > ?' if after_name is not None else ''
+    params = [window_days] + ([after_name] if after_name is not None else []) + [max_rows + 1]
+    keys = [r['name'] for r in conn.execute(
+        f'SELECT m.name FROM market_items m WHERE {missing_sql} {cursor_sql} ORDER BY m.name LIMIT ?',params)]
+    if len(keys) > max_rows and not allow_more:
+        raise RuntimeError('Unpriced projection row cap exceeded before insertion')
+    has_more = len(keys) > max_rows
+    keys = keys[:max_rows]
+    rows = []
+    for start in range(0,len(keys),400):
+        chunk = keys[start:start+400]
+        marks = ','.join('?' for _ in chunk)
+        rows.extend(dict(r) for r in conn.execute(
+            f"""SELECT m.name, COALESCE(c.market_hash_name,m.market_hash_name,m.name) AS marketHashName,
+                       m.market_hash_name AS legacyMarketHashName,
+                       COALESCE(c.kind,m.kind) AS kind, COALESCE(c.item_type,m.item_type) AS itemType,
+                       COALESCE(c.weapon,m.weapon) AS weapon, COALESCE(c.collection,m.collection) AS collection,
+                       COALESCE(c.rarity,m.rarity) AS rarity,
+                       m.primary_price, m.primary_provider, m.primary_price_basis,
+                       m.primary_price_updated_at, m.primary_confidence_pct
+                  FROM market_items m LEFT JOIN item_catalog c ON c.name=m.name
+                 WHERE m.name IN ({marks}) ORDER BY m.name""",chunk))
+    aliases = list(dict.fromkeys(n for r in rows for n in (r['name'],r['marketHashName'],r['legacyMarketHashName']) if n))
+    providers = tuple(CURRENT_PRICE_PROVIDERS)
+    provider_marks = ','.join('?' for _ in providers)
+    prices = {}
+    for start in range(0,len(aliases),400):
+        chunk = aliases[start:start+400]
+        marks = ','.join('?' for _ in chunk)
+        for saved in conn.execute(
+            f"""SELECT name,provider,price,solid_price,lowest_sell_order,highest_buy_order,
+                       spread_pct,stability_pct,confidence_pct,source,basis,kind,updated_at
+                  FROM market_item_prices WHERE name IN ({marks}) AND provider IN ({provider_marks})""",
+            chunk+list(providers)):
+            quote = dict(saved)
+            if positive(quote['solid_price']) or positive(quote['price']):
+                prices.setdefault(quote['name'],{})[quote['provider']] = quote
+    payload = []
+    for row in rows:
+        quotes = {}
+        for alias in (row['name'],row['marketHashName'],row['legacyMarketHashName']):
+            for provider,quote in prices.get(alias,{}).items():
+                if provider not in quotes or int(quote['updated_at'] or 0) > int(quotes[provider]['updated_at'] or 0):
+                    quotes[provider] = quote
+        primary = next((quotes[p] for p in PRIMARY_PRICE_PROVIDER_ORDER if p in quotes),None)
+        if primary is None and row['primary_provider'] in providers and positive(row['primary_price']):
+            primary = {'provider':row['primary_provider'],'price':row['primary_price'],
+                       'basis':row['primary_price_basis'],'updated_at':row['primary_price_updated_at'],
+                       'confidence_pct':row['primary_confidence_pct']}
+        primary = primary or {}
+        latest = positive(primary.get('solid_price')) or positive(primary.get('price'))
+        summary = {provider:{'label':PRICE_PROVIDER_LABELS.get(provider,provider),
+                   'price':q.get('price'),'solidPrice':q.get('solid_price'),
+                   'lowestSellOrder':q.get('lowest_sell_order'),'highestBuyOrder':q.get('highest_buy_order'),
+                   'spreadPct':q.get('spread_pct'),'stabilityPct':q.get('stability_pct'),
+                   'confidencePct':q.get('confidence_pct'),'source':q.get('source'),
+                   'basis':q.get('basis'),'kind':q.get('kind'),'updatedAt':q.get('updated_at')}
+                   for provider,q in quotes.items()}
+        source = primary.get('provider') or ('saved_primary' if latest else 'catalog_unpriced')
+        steam = quotes.get('steam_snapshot',{})
+        # Keep full name-derived tags but avoid opening the global alias cache.
+        meta = {**row,'item_type':row['itemType'],'type':row['itemType'],'latestPrice':latest,'volume':None}
+        groups = market_group_tags(meta,collection_alias_resolver=lambda collection:None)
+        labels = [group_tag_label(tag) for tag in groups]
+        search = ' '.join(str(v) for v in [row['name'],row['marketHashName'],row['kind'],
+                 row['itemType'],row['weapon'],row['collection'],row['rarity'],source,
+                 ' '.join(labels)] if v).lower()
+        payload.append((window_days,row['name'],row['marketHashName'],row['kind'],row['itemType'],
+                        row['weapon'],row['collection'],row['rarity'],latest,None,None,None,
+                        primary.get('updated_at'),source,None,None,None,json.dumps(groups,separators=(',',':')),
+                        search,0,positive(steam.get('price')),positive(steam.get('lowest_sell_order')),
+                        positive(steam.get('highest_buy_order')),positive(steam.get('spread_pct')),
+                        positive(steam.get('stability_pct')),primary.get('basis'),
+                        positive(primary.get('confidence_pct')),json.dumps(summary,separators=(',',':'))))
+    if return_batch:
+        return {'rows':payload,'requested':len(keys),'lastKey':keys[-1] if keys else after_name,'hasMore':has_more}
+    return payload
+
+
+def append_missing_unpriced_market_lookup(conn, window_days, max_rows=5000,
+                                         after_name=None, allow_more=False):
+    """Insert missing metadata/current-price rows; caller owns the transaction."""
+    if not conn.in_transaction:
+        raise RuntimeError('Explicit transaction required for unpriced projection')
+    batch = build_unpriced_market_lookup_rows(conn,window_days,max_rows=max_rows,
+                after_name=after_name,allow_more=allow_more,return_batch=True)
+    rows = batch.pop('rows')
+    if not rows:
+        return {'inserted':0,'windowDays':window_days,**batch}
+    inserted_cursor = conn.executemany(
+        """INSERT INTO market_item_lookup
+           (window_days,name,market_hash_name,kind,item_type,weapon,collection,rarity,
+            latest_price,prior_price,change_pct,change_dollar,latest_at,source,volatility_pct,
+            history_points,edge_case_count,groups_json,search_text,metric_updated_at,
+            steam_price,steam_lowest_sell_order,steam_highest_buy_order,steam_spread_pct,
+            steam_stability_pct,price_basis,confidence_pct,provider_prices_json)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(window_days,name) DO NOTHING""",rows)
+    inserted = inserted_cursor.rowcount
+    receipt = market_read_receipt(conn,'market_lookup_receipt:'+str(window_days)) or {}
+    filters = receipt.get('filters') or {}
+    # A metadata-only insertion cannot verify a stale whole-window price receipt.
+    # Retain its last price timestamp and mark totals/currentness unknown.
+    receipt.update({'sourceRevision':None,'rows':None,'priced':None,'priorPriced':None,
+                    'sources':[], 'unpricedProjectionAdded':inserted,'unpricedProjectionAt':int(time.time()),
+                    'filters':{'collections':sorted(set(filters.get('collections') or []) | {r[6] for r in rows if r[6]}),
+                               'types':sorted(set(filters.get('types') or []) | {r[4] or r[5] or r[3] for r in rows if r[4] or r[5] or r[3]}),
+                               'grades':sorted(set(filters.get('grades') or []) | {r[7] for r in rows if r[7]}),
+                               'available':True}})
+    save_market_read_receipt(conn,'market_lookup_receipt:'+str(window_days),receipt)
+    return {'inserted':inserted,'windowDays':window_days,'receiptCurrentness':'unverified',**batch}
 
 
 def rebuild_market_item_lookup(conn, window_days):
+    if preserve_recovered_research_without_inputs(conn):
+        return conn.execute('SELECT COUNT(*) FROM market_item_lookup WHERE window_days=?',
+                            (window_days,)).fetchone()[0]
+    flush_market_source_revision(conn)
     meta_name_expr = "COALESCE(c1.name, c2.name, m.name)"
     meta_hash_expr = "COALESCE(c1.market_hash_name, c2.market_hash_name, m.name)"
     meta_type_expr = "COALESCE(c1.item_type, c2.item_type)"
@@ -5873,6 +9038,17 @@ def rebuild_market_item_lookup(conn, window_days):
             _positive_float((primary or {}).get('confidence_pct')),
             json.dumps(summary, separators=(',', ':')),
         ))
+    # Preserve listings without metrics in explicit rebuilds. Missing prices
+    # remain unknown; current saved quotes do not require history coverage.
+    priced_names = {row[1] for row in payload}
+    projection_cursor = None
+    while True:
+        projected = build_unpriced_market_lookup_rows(
+            conn, window_days, missing_only=False, after_name=projection_cursor, allow_more=True)
+        payload.extend(row for row in projected if row[1] not in priced_names)
+        if len(projected) < 5000:
+            break
+        projection_cursor = projected[-1][1]
     conn.execute("DELETE FROM market_item_lookup WHERE window_days=?", (window_days,))
     conn.executemany(
         """INSERT OR REPLACE INTO market_item_lookup
@@ -5885,52 +9061,45 @@ def rebuild_market_item_lookup(conn, window_days):
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         payload,
     )
+    # Reuse the rows this explicit task has already materialized. GETs need no
+    # global COUNT/MAX/DISTINCT pass to describe this saved cache.
+    saved = list({row[1]:row for row in payload}.values())
+    revision = conn.execute("SELECT value FROM settings WHERE key='market_source_revision'").fetchone()
+    if not revision:
+        mark_market_source_changed(conn)
+        flush_market_source_revision(conn)
+        revision = conn.execute("SELECT value FROM settings WHERE key='market_source_revision'").fetchone()
+    sources = {}
+    for row in saved:
+        if row[13]:
+            sources[row[13]] = sources.get(row[13],0)+1
+    save_market_read_receipt(conn,'market_lookup_receipt:'+str(window_days),{
+        'lookupBuildVersion':LOOKUP_BUILD_VERSION,'metricBuildVersion':METRIC_BUILD_VERSION,
+        'metricsVerified':metric_window_is_current(conn,window_days),
+        'sourceRevision':revision['value'],'builtAt':int(time.time()),
+        'sourceAsOf':max((int(row[12] or 0) for row in saved),default=0),
+        'rows':len(saved),'priced':sum(row[8] is not None for row in saved),
+        'priorPriced':sum(row[9] is not None for row in saved),
+        'sources':[{'source':source,'items':count} for source,count in sorted(sources.items(),key=lambda pair:(-pair[1],pair[0]))[:12]],
+        'filters':{'collections':sorted({row[6] for row in saved if row[6]}),
+                   'types':sorted({row[4] or row[5] or row[3] for row in saved if row[4] or row[5] or row[3]}),
+                   'grades':sorted({row[7] for row in saved if row[7]}),'available':True},
+    })
     return len(payload)
 
 
 def ensure_market_item_lookup(conn, window_days):
-    if market_item_lookup_is_current(conn, window_days):
-        return
-    with SQLITE_WRITE_LOCK:
-        with db() as write_conn:
-            metrics = write_conn.execute(
-                "SELECT COUNT(*) AS n FROM item_market_metrics WHERE provider='market' AND window_days=?",
-                (window_days,),
-            ).fetchone()
-            rebuilt_metrics = False
-            if not metrics or int(metrics['n'] or 0) == 0 or not metric_window_is_current(write_conn, window_days):
-                rebuild_market_metrics(write_conn, window_days)
-                rebuilt_metrics = True
-            if market_item_lookup_is_current(write_conn, window_days):
-                return
-            if not rebuilt_metrics:
-                rebuild_market_metrics(write_conn, window_days)
-            rebuild_market_item_lookup(write_conn, window_days)
-            write_conn.commit()
+    return market_cache_state(conn,window_days)
 
 
 def market_item_lookup_status(conn, window_days):
-    row = conn.execute(
-        """SELECT COUNT(*) AS n,
-                  SUM(CASE WHEN latest_price IS NOT NULL THEN 1 ELSE 0 END) AS priced,
-                  SUM(CASE WHEN prior_price IS NOT NULL THEN 1 ELSE 0 END) AS prior_priced,
-                  MAX(latest_at) AS latest_at
-           FROM market_item_lookup
-           WHERE window_days=?""",
-        (window_days,),
-    ).fetchone()
-    sources = [dict(r) for r in conn.execute(
-        """SELECT source, COUNT(*) AS items
-           FROM market_item_lookup
-           WHERE window_days=? AND source IS NOT NULL
-           GROUP BY source
-           ORDER BY items DESC
-           LIMIT 12""",
-        (window_days,),
-    )]
-    total = int(row['n'] or 0) if row else 0
-    priced = int(row['priced'] or 0) if row else 0
-    prior_priced = int(row['prior_priced'] or 0) if row else 0
+    receipt = market_read_receipt(conn,'market_lookup_receipt:'+str(window_days)) or {}
+    total,priced,prior_priced = receipt.get('rows'),receipt.get('priced'),receipt.get('priorPriced')
+    latest = receipt.get('sourceAsOf')
+    recovered = recovered_research_status(conn, window_days) if not receipt else None
+    if recovered:
+        total = recovered.get('lookupRowsAtRecovery')
+        latest = recovered.get('sourceAsOf')
     return {
         'catalogItems': total,
         'marketItems': total,
@@ -5938,14 +9107,16 @@ def market_item_lookup_status(conn, window_days):
         'observedItems': priced,
         'observationRows': total,
         'priorItems': prior_priced,
-        'priorCoveragePct': round((prior_priced / priced) * 100, 1) if priced else 0,
-        'latestObservationAt': int(row['latest_at'] or 0) if row else 0,
-        'coveragePct': round((priced / total) * 100, 1) if total else 0,
-        'sources': sources,
+        'priorCoveragePct': round((prior_priced / priced) * 100, 1) if priced else None,
+        'latestObservationAt': latest,
+        'coveragePct': round((priced / total) * 100, 1) if total and priced is not None else None,
+        'sources': receipt.get('sources',[]),
+        'countState':'saved_receipt' if receipt else 'recovered_window_receipt' if recovered else 'not_counted',
+        **market_cache_state(conn,window_days),
         'dataset': {
-            'id': f'market-item-lookup:{window_days}:{int(row["latest_at"] or 0) if row else 0}:{total}',
+            'id': f'market-item-lookup:{window_days}:{latest}:{total}',
             'source': 'cached market item lookup',
-            'asOf': int(row['latest_at'] or 0) if row else 0,
+            'asOf': latest,
             'observedItems': priced,
             'observationRows': total,
             'implication': 'Search and sorting are served from a local ranked lookup table.',
@@ -5966,8 +9137,11 @@ def market_universe_item_slice(
     max_price=None,
     sort_key='changePct',
     sort_dir=-1,
+    projection='',
+    offset=0,
 ):
     limit = parse_int_param(limit, 500, minimum=25, maximum=1000)
+    offset = parse_int_param(offset, 0, minimum=0, maximum=100000)
     terms = split_filter_terms(terms or []) + split_filter_terms(search)
     blacklist = split_filter_terms(blacklist or [])
     collection = (collection or '').strip()
@@ -6033,11 +9207,13 @@ def market_universe_item_slice(
     sort_clause = f"({sort_expr}) IS NULL ASC, {sort_expr} {'ASC' if sort_dir == 1 else 'DESC'}"
     if sort_key != 'name':
         sort_clause += ", LOWER(name) ASC"
+    # Stabilize case-distinct names across pages and all query plans.
+    sort_clause += ", name COLLATE BINARY ASC"
 
     params = []
-    with db() as conn:
+    with closing(catalog_read_db()) as conn:
+        conn.execute('BEGIN')
         metric_window, exact_window, metric_count = resolve_market_metric_window(conn, history_days)
-        ensure_market_item_lookup(conn, metric_window)
         filters = ["window_days=?"]
         params.append(metric_window)
         for term in terms:
@@ -6063,7 +9239,76 @@ def market_universe_item_slice(
             params.append(max_price)
         where = " AND ".join(filters)
         base_sql = f"FROM market_item_lookup WHERE {where}"
-        total = conn.execute(f"SELECT COUNT(*) {base_sql}", params).fetchone()[0]
+        count_sql = f"SELECT COUNT(*) {base_sql}"
+        if len(filters) == 1 and not getattr(conn, '_derived_generation', None):
+            # Unfiltered counts include NULL prices. Prefer the existing small
+            # window/price index only after verifying its complete definition.
+            count_index = conn.execute(
+                "SELECT sql FROM sqlite_schema WHERE type='index' "
+                "AND tbl_name='market_item_lookup' "
+                "AND name='idx_market_item_lookup_window_price'").fetchone()
+            expected_index = ("CREATE INDEX idx_market_item_lookup_window_price "
+                              "ON market_item_lookup(window_days, latest_price)")
+            if (count_index and re.sub(r"\s+", "", count_index['sql'] or '').lower()
+                    == re.sub(r"\s+", "", expected_index).lower()):
+                count_sql = ("SELECT COUNT(*) FROM market_item_lookup "
+                             "INDEXED BY idx_market_item_lookup_window_price WHERE window_days=?")
+        if len(filters) == 1 and getattr(conn, '_derived_generation', None):
+            count_sql = 'SELECT COUNT(*) FROM saved_generation.lookup_windows WHERE window_days=?'
+        prepared_generation_ids = None
+        generation_indexes = getattr(conn, '_derived_generation_indexes', ())
+        if (offset == 0 and getattr(conn, '_derived_generation', None) and terms and not blacklist
+                and not collection and not item_type and not grade
+                and min_price is None and max_price is None
+                and sort_key == 'changePct' and sort_dir == -1
+                and {'lookup_common_search_v1', 'lookup_common_windows_v1'} <= set(generation_indexes)):
+            contains = ' AND '.join(['w.window_days=?'] + ['c.search_text LIKE ?'] * len(terms))
+            matches = conn.execute(
+                'SELECT w.source_rowid,COUNT(*) OVER() AS matched_total '
+                'FROM saved_generation.lookup_common c INDEXED BY lookup_common_search_v1 '
+                'CROSS JOIN saved_generation.lookup_windows w INDEXED BY lookup_common_windows_v1 '
+                'WHERE w.common_id=c.common_id AND ' + contains +
+                ' ORDER BY (w.change_pct) IS NULL ASC,w.change_pct DESC,LOWER(w.name) ASC,w.name COLLATE BINARY ASC LIMIT ?',
+                params + [limit]).fetchall()
+            total = matches[0]['matched_total'] if matches else 0
+            prepared_generation_ids = [row['source_rowid'] for row in matches]
+        else:
+            total = conn.execute(count_sql, params).fetchone()[0]
+        # Contains searches can examine the compact rank/search index first,
+        # then fetch payload columns only for the final page. Without that
+        # optional index the same SQL remains valid; never force an index.
+        page_sql, page_params = base_sql, params + [limit]
+        if (offset == 0 and not getattr(conn, '_derived_generation', None) and terms and not blacklist and not collection and not item_type and not grade
+                and min_price is None and max_price is None
+                and sort_key == 'changePct' and sort_dir == -1
+                and conn.execute("SELECT 1 FROM sqlite_schema WHERE type='index' "
+                                 "AND tbl_name='market_item_lookup' "
+                                 "AND name='idx_market_lookup_search_order_v1'").fetchone()):
+            page_sql = ("FROM market_item_lookup WHERE rowid IN ("
+                        f"SELECT rowid {base_sql} ORDER BY {sort_clause} LIMIT ?)")
+            page_params = params + [limit, limit]
+        generation_indexes = getattr(conn, '_derived_generation_indexes', ())
+        generation_active = bool(getattr(conn, '_derived_generation', None))
+        simple_generation_filter = (offset == 0 and generation_active and not blacklist and not collection
+            and not item_type and not grade and min_price is None and max_price is None)
+        if prepared_generation_ids is not None:
+            page_sql = 'FROM market_item_lookup WHERE rowid IN (SELECT value FROM json_each(?))'
+            page_params = [json.dumps(prepared_generation_ids,separators=(',',':')), limit]
+        elif simple_generation_filter and not terms and sort_key == 'name':
+            page_sql = ('FROM market_item_lookup WHERE rowid IN (SELECT source_rowid '
+                'FROM saved_generation.lookup_windows WHERE window_days=? '
+                'ORDER BY LOWER(name) ' + ('ASC' if sort_dir == 1 else 'DESC') + ' LIMIT ?)')
+            page_params = params + [limit, limit]
+        elif (simple_generation_filter and not terms and sort_key == 'latestPrice'
+                and {'lookup_common_price_v1', 'lookup_common_windows_v1'} <= set(generation_indexes)):
+            page_sql = ('FROM market_item_lookup WHERE rowid IN ('
+                'SELECT w.source_rowid FROM saved_generation.lookup_common c '
+                'INDEXED BY lookup_common_price_v1 CROSS JOIN saved_generation.lookup_windows w '
+                'INDEXED BY lookup_common_windows_v1 WHERE w.common_id=c.common_id AND w.window_days=? '
+                'ORDER BY (c.latest_price) IS NULL ASC,c.latest_price ' +
+                ('ASC' if sort_dir == 1 else 'DESC') + ',LOWER(w.name) ASC LIMIT ?)')
+            page_params = params + [limit, limit]
+        page_params = page_params + [offset]
         rows = [dict(r) for r in conn.execute(
             f"""SELECT
                   name,
@@ -6091,10 +9336,10 @@ def market_universe_item_slice(
                   history_points AS historyPoints,
                   edge_case_count AS edgeCaseCount,
                   groups_json AS groupsJson
-                {base_sql}
+                {page_sql}
                 ORDER BY {sort_clause}
-                LIMIT ?""",
-            params + [limit],
+                LIMIT ? OFFSET ?""",
+            page_params,
         )]
         window_metrics = market_item_metric_windows(conn, rows)
         options = market_item_lookup_filter_options(conn, metric_window)
@@ -6117,7 +9362,7 @@ def market_universe_item_slice(
             'volatilityWindows': window_metrics.get(idx, {}),
         }))
 
-    return {
+    return project_market_item_response({
         'ok': True,
         'generatedAt': int(time.time()),
         'historyDays': parse_int_param(history_days, 90, allowed=VOLATILITY_WINDOWS),
@@ -6125,10 +9370,15 @@ def market_universe_item_slice(
         'metricWindowExact': exact_window,
         'metricRows': metric_count,
         'limit': limit,
+        'offset': offset,
+        'hasMore': offset + len(out) < total,
+        'nextOffset': offset + len(out) if offset + len(out) < total else None,
         'totalItems': total,
         'returnedItems': len(out),
         'items': out,
         'filters': options,
+        'dataState':status['dataState'],'cacheState':status['cacheState'],
+        'rebuildRequired':status['rebuildRequired'],'freshness':status['freshness'],
         'coverage': {
             **status,
             'movingItems': total,
@@ -6137,7 +9387,14 @@ def market_universe_item_slice(
             'metricWindowExact': exact_window,
             'metricRows': metric_count,
         },
-    }
+    }, projection)
+
+
+market_universe_item_slice = market_slice_cache.wrap_market_item_slice(
+    market_universe_item_slice, catalog_read_db, VOLATILITY_WINDOWS,
+    LOOKUP_BUILD_VERSION, METRIC_BUILD_VERSION,
+    publication_fence=lambda conn: BULK_STAGING_HOST.engine.external()
+        if bulk_staging_enabled(conn) else None)
 
 
 def market_lookup_analysis_items(history_days=90, limit=100000):
@@ -6149,7 +9406,7 @@ def market_lookup_analysis_items(history_days=90, limit=100000):
     """
     history_days = parse_int_param(history_days, 90, allowed=VOLATILITY_WINDOWS)
     limit = parse_int_param(limit, 100000, minimum=1, maximum=100000)
-    with db() as conn:
+    with closing(catalog_read_db()) as conn:
         metric_window, _exact_window, _metric_count = resolve_market_metric_window(conn, history_days)
         ensure_market_item_lookup(conn, metric_window)
         rows = [dict(r) for r in conn.execute(
@@ -6254,7 +9511,7 @@ def market_universe_analysis(history_days=90, limit=120, min_group=3):
     limit = parse_int_param(limit, 120, minimum=10, maximum=500)
     min_group = parse_int_param(min_group, 3, minimum=1, maximum=100)
     catalog = market_lookup_analysis_items(history_days=history_days, limit=100000)
-    with db() as conn:
+    with closing(catalog_read_db()) as conn:
         metric_window, exact_window, metric_count = resolve_market_metric_window(conn, history_days)
         ensure_market_item_lookup(conn, metric_window)
         coverage = market_item_lookup_status(conn, metric_window)
@@ -6998,12 +10255,12 @@ def aggregate_group_history(scope='portfolio', dimension=None, group=None, histo
         'dimension': dimension,
         'group': group,
         'summary': summary,
-        'basis': ('steam_history_cleaned_interpolated_current_backfill' if has_backfill else 'steam_history_cleaned_interpolated') if out.get('points') else 'warming',
+        'basis': 'steam_history_cleaned_interpolated' if out.get('points') else 'history_unavailable',
         'basisDetail': (
             'Cleaned/interpolated raw Steam chart history with current-price backfill for group items without cached chart rows. Dashed points identify carried/backfilled values.'
             if has_backfill else
             'Cleaned/interpolated raw Steam chart history. Carried-forward points are flagged per point.'
-        ) if out.get('points') else 'Steam chart history is warming for this group.',
+        ) if out.get('points') else 'No qualified cached raw Steam chart history is available for this group. An authenticated refresh can request genuine observations within shared provider pacing and access limits.',
         'carriedForwardPoints': coverage.get('carriedForwardPoints', 0),
     })
     return out
@@ -7049,17 +10306,24 @@ def h(value):
 
 
 def fmt_money(value):
+    if value is None:
+        return 'Unavailable'
     try:
-        return '${:,.2f}'.format(float(value or 0))
+        value = float(value)
+        return '${:,.2f}'.format(value) if math.isfinite(value) else 'Unavailable'
     except (TypeError, ValueError):
-        return '$0.00'
+        return 'Unavailable'
 
 
 def fmt_pct(value):
+    if value is None:
+        return 'Unavailable'
     try:
-        value = float(value or 0)
+        value = float(value)
     except (TypeError, ValueError):
-        value = 0
+        return 'Unavailable'
+    if not math.isfinite(value):
+        return 'Unavailable'
     return '{}{:.2f}%'.format('+' if value > 0 else '', value)
 
 
@@ -7313,11 +10577,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if args and str(args[1]) not in ('200', '204', '304'):
             super().log_message(fmt, *args)
 
-    def _is_local(self):
-        """Check if the request originates from localhost."""
-        addr = self.client_address[0]
-        return addr in LOCAL_ADDRS
-
     def safe_write(self, body):
         try:
             self.wfile.write(body)
@@ -7369,11 +10628,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def current_user(self):
         if not AUTH_ENABLED:
             return AUTH_USERNAME
-        return get_session_user(self._cookies().get(SESSION_COOKIE))
+        path = self.path.split('?')[0]
+        readonly = self.command in ('GET','HEAD')
+        return get_session_user(self._cookies().get(SESSION_COOKIE), readonly=readonly)
 
     def require_auth(self, path, method):
         """Return True if the request may proceed; otherwise emit a denial."""
         if not AUTH_ENABLED:
+            return True
+        if PUBLIC_READONLY and method == 'GET' and path in ANON_GET_PATHS:
             return True
         if method == 'GET' and path in PUBLIC_GET_PATHS:
             return True
@@ -7391,13 +10654,104 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return False
 
     def do_GET(self):
+        try:
+            return self._do_GET_with_capacity_response()
+        except LegacyBulkCapacityDeferred as error:
+            return self.send_json({'ok': False, 'state': 'capacity_deferred',
+                                   'error': str(error), 'savedDataAvailable': True,
+                                   'currentCashIndependent': True}, 503)
+
+    def _do_GET_with_capacity_response(self):
         path = self.path.split('?')[0]
 
         if not self.require_auth(path, 'GET'):
             return
 
+        user = self.current_user()
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        if path in ('/api/canonical-cash-value', '/api/canonical-cash-prices'):
+            try:
+                if path == '/api/canonical-cash-value':
+                    value = canonical_cash_service().value(query.get('portfolio_id', [None])[0])
+                else:
+                    names_json = query.get('names', ['[]'])[0]
+                    if len(names_json.encode('utf-8')) > 131072:
+                        raise ValueError('Exact-name request exceeds its bound')
+                    value = canonical_cash_service().prices(json.loads(names_json))
+                self.send_json(value)
+            except cash_prices.CashError as error:
+                self.send_json({'error': str(error)}, error.status)
+            except (ValueError, UnicodeError) as error:
+                self.send_json({'error': str(error)}, 400)
+            except (sqlite3.Error, bulk_derived_staging.Deferred):
+                self.send_json({'error': 'Saved current cash quotes are unavailable; no refresh was requested.'}, 503)
+            return
+
+        if path in ('/api/cash-value', '/api/cash-price-jobs'):
+            try:
+                if query.get('provider', ['skinport_live'])[0] != cash_prices.PROVIDER:
+                    raise ValueError('Only skinport_live cash pricing is supported')
+                if path == '/api/cash-value':
+                    value = cash_price_service().value(query.get('portfolio_id', [None])[0])
+                else:
+                    value = cash_price_service().status(query.get('id', [None])[0])
+                    value['cadence'] = CASH_PRICE_CADENCE.status(value)
+                    value['holdingsIdentityRevision'] = cash_holdings_identity_revision()
+                self.send_json(value)
+            except cash_prices.CashError as error:
+                self.send_json({'error': str(error), 'provider': cash_prices.PROVIDER}, error.status)
+            except (ValueError, UnicodeError) as error:
+                self.send_json({'error': str(error)}, 400)
+            except sqlite3.Error:
+                self.send_json({'error': 'Saved cash storage is unavailable; no refresh was requested.'}, 503)
+            return
+
+        if path == '/api/bulk-derived-status':
+            if self.client_address[0] not in LOCAL_ADDRS or not self.require_auth(path,'GET'):
+                if self.client_address[0] not in LOCAL_ADDRS:
+                    self.send_json({'error':'Derived operator status is local-only'},403)
+                return
+            try:
+                with closing(steam_ask_db()) as status_conn:
+                    status_conn.execute('BEGIN')
+                    result = BULK_STAGING_RUNTIME.saved_status(status_conn)
+                    head = bulk_derived_staging.get_json(status_conn,bulk_derived_staging.PUBLISHED_KEY)
+                    result['publishedToken'] = head.get('publishToken') if head else None
+                self.send_json(result)
+            except (sqlite3.Error,bulk_derived_staging.Deferred,OSError) as error:
+                self.send_json({'error':str(error)},503)
+            return
+
+        if path in ('/api/steam-ask-value', '/api/steam-ask-jobs'):
+            try:
+                if path == '/api/steam-ask-value':
+                    portfolio_id = query.get('portfolio_id', [None])[0]
+                    if portfolio_id is not None and len(portfolio_id) > 128:
+                        raise ValueError('Invalid portfolio ID')
+                    value = steam_ask_value_response(portfolio_id, int(query.get('freshness_seconds', ['3600'])[0]), summary=query.get('summary',['0'])[0] == '1')
+                else:
+                    job_id = query.get('id', [None])[0]
+                    if job_id is not None and re.fullmatch(r'[0-9a-f]{32}', job_id) is None:
+                        raise ValueError('Invalid job ID')
+                    value = steam_ask_job_response(job_id)
+                self.send_json(value)
+            except ValueError as error:
+                self.send_json({'error': str(error)}, 400)
+            except (sqlite3.Error, steam_held_asks.AskSchemaUnavailable, steam_request_governor.GovernorError):
+                self.send_json({'error': 'Durable Steam ask storage or request governor is unavailable.'}, 503)
+            return
+
+        if PUBLIC_READONLY and not user:
+            query = anon_sanitize_query(query)
+
+        if path in ITEM_READ_PATHS or (CATALOG_COMPATIBILITY_FEED_ENABLED and path == '/api/catalog'):
+            payload, status = catalog_read_payload(path, query)
+            self.send_json(payload, status)
+            return
+
         if path == '/api/health':
-            self.send_json({'ok': True, 'app': APP_NAME, 'version': APP_VERSION})
+            self.send_json({'ok': True, 'app': APP_NAME, 'version': APP_VERSION,
+                            'build': globals().get('BUILD_IDENTITY')})
 
         elif path == '/login':
             body = render_login_page().encode('utf-8')
@@ -7437,36 +10791,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
 
         elif path == '/api/status':
-            snaps = get_snapshots()
-            portfolios = get_portfolios()
-            with db() as conn:
-                catalog_count = conn.execute("SELECT COUNT(*) FROM item_catalog").fetchone()[0]
-                price_count = conn.execute("SELECT COUNT(*) FROM market_item_prices").fetchone()[0]
-                market_item_count = conn.execute("SELECT COUNT(*) FROM market_items").fetchone()[0]
-                history_count = conn.execute("SELECT COUNT(*) FROM price_history").fetchone()[0]
-                observation_count = conn.execute("SELECT COUNT(*) FROM price_observations").fetchone()[0]
-                shared_current_count = conn.execute("SELECT COUNT(*) FROM shared_item_prices").fetchone()[0]
-                shared_history_count = conn.execute("SELECT COUNT(*) FROM shared_price_history").fetchone()[0]
-                shared_observation_count = conn.execute("SELECT COUNT(*) FROM shared_price_observations").fetchone()[0]
-                indexed_count = conn.execute("SELECT COUNT(*) FROM snapshot_items").fetchone()[0]
-                portfolio_item_count = conn.execute("SELECT COUNT(*) FROM portfolio_items").fetchone()[0]
-            self.send_json({
-                'ok': True,
-                'snaps': len(snaps),
-                'portfolios': len(portfolios),
-                'catalog': catalog_count,
-                'marketItems': market_item_count,
-                'prices': price_count,
-                'priceHistoryRows': history_count,
-                'priceObservationRows': observation_count,
-                'sharedPriceRows': shared_current_count,
-                'sharedPriceHistoryRows': shared_history_count,
-                'sharedPriceObservationRows': shared_observation_count,
-                'indexedRows': indexed_count,
-                'portfolioItems': portfolio_item_count,
-                'data_dir': DATA_DIR,
-                'database': DB_FILE,
-            })
+            self.send_json(application_status())
 
         elif path == '/api/snaps':
             self.send_json(get_snapshots())
@@ -7478,13 +10803,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(get_settings())
 
         elif path == '/api/access':
-            self.send_json({'canDelete': self._is_local()})
+            self.send_json({
+                'canDelete': bool(user),
+                'canEdit': bool(user),
+                'readonly': PUBLIC_READONLY and not user,
+            })
 
         elif path == '/api/catalog':
             self.send_json(catalog_payload())
 
         elif path == '/api/prices':
-            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             raw_names = query.get('names', ['[]'])[0]
             force = query.get('force', ['0'])[0].lower() in ('1', 'true', 'yes')
             try:
@@ -7497,34 +10825,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(shared_pricing_status())
 
         elif path == '/api/shared-item-pricing':
-            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             name = query.get('name', [''])[0]
             history_limit = query.get('history_limit', ['500'])[0]
             self.send_json(shared_item_pricing(name, history_limit=history_limit))
 
         elif path == '/api/history':
-            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             name = query.get('name', [''])[0]
             market_hash_name = query.get('hash', [''])[0] or query.get('market_hash_name', [''])[0]
             force = query.get('force', ['0'])[0].lower() in ('1', 'true', 'yes')
             self.send_json(get_price_history(name, force=force, market_hash_name=market_hash_name or None))
 
         elif path == '/api/analysis':
-            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             days = query.get('days', query.get('scale', query.get('history_days', query.get('history', ['90']))))[0]
             limit = query.get('limit', ['120'])[0]
             min_group = query.get('min_group', ['3'])[0]
             self.send_json(market_universe_analysis(history_days=days, limit=limit, min_group=min_group))
 
         elif path == '/api/market-universe':
-            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             days = query.get('days', query.get('history_days', ['90']))[0]
             limit = query.get('limit', ['120'])[0]
             min_group = query.get('min_group', ['3'])[0]
             self.send_json(market_universe_analysis(history_days=days, limit=limit, min_group=min_group))
 
         elif path == '/api/market-items':
-            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             days = query.get('days', query.get('history_days', ['90']))[0]
             limit = query.get('limit', ['60000'])[0]
             self.send_json(market_universe_item_slice(
@@ -7540,10 +10863,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 max_price=query.get('max_price', [''])[0],
                 sort_key=query.get('sort', ['changePct'])[0],
                 sort_dir=query.get('dir', ['-1'])[0],
+                projection=query.get('projection', [''])[0],
+                offset=query.get('offset', ['0'])[0],
             ))
 
         elif path == '/api/taxonomy-analysis':
-            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             scope = query.get('scope', ['portfolio'])[0]
             days = query.get('days', query.get('history_days', ['90']))[0]
             portfolio_id = query.get('portfolio', [''])[0] or None
@@ -7558,7 +10882,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             ))
 
         elif path == '/api/group-history':
-            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             scope = query.get('scope', ['portfolio'])[0]
             days = query.get('days', query.get('history_days', ['90']))[0]
             portfolio_id = query.get('portfolio', [''])[0] or None
@@ -7581,7 +10904,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             ))
 
         elif path == '/api/group-item-history':
-            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             scope = query.get('scope', ['portfolio'])[0]
             days = query.get('days', query.get('history_days', ['90']))[0]
             portfolio_id = query.get('portfolio', [''])[0] or None
@@ -7606,7 +10928,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             ))
 
         elif path == '/api/market-universe-sync':
-            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             mode = query.get('mode', ['batch'])[0].lower()
             if mode == 'bulk':
                 provider = query.get('provider', ['auto'])[0]
@@ -7631,13 +10952,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(market_universe_sync_batch(offset=offset, limit=limit, force=force, kind=kind))
 
         elif path == '/api/market-universe-status':
-            self.send_json(market_universe_status())
+            self.send_json(market_universe_status(projection=query.get('projection', [None])[0]))
 
         elif path == '/api/data-tasks':
             self.send_json(data_task_snapshot())
 
         elif path == '/api/inventory':
-            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            projection = query.get('projection', [''])[0]
+            if projection == 'portfolio-value-v1':
+                if any(query.get(key, ['0'])[0].lower() in ('1', 'true', 'yes')
+                       for key in ('refresh', 'refresh_history', 'force')):
+                    self.send_json({'error': 'portfolio-value-v1 only reads saved current quotes'}, 400)
+                    return
+                self.send_json(get_portfolio_current_value(
+                    limit=query.get('limit', ['2000'])[0],
+                    portfolio_id=query.get('portfolio', [''])[0] or None))
+                return
             scale = query.get('days', query.get('scale', ['90']))[0]
             hist_days = query.get('history_days', query.get('history', [None]))[0]
             portfolio_id = query.get('portfolio', [''])[0] or None
@@ -7660,7 +10990,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             ))
 
         elif path == '/api/portfolio-history':
-            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             days = query.get('days', query.get('history_days', ['90']))[0]
             portfolio_id = query.get('portfolio', [''])[0] or None
             points = query.get('points', ['220'])[0]
@@ -7677,7 +11006,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             ))
 
         elif path == '/api/portfolio-sync':
-            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             scale = query.get('days', query.get('scale', ['90']))[0]
             hist_days = query.get('history_days', [None])[0]
             portfolio_id = query.get('portfolio', [''])[0] or None
@@ -7704,6 +11032,76 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         path = self.path.split('?')[0]
         if not self.require_auth(path, 'POST'):
+            return
+
+        if path == '/api/bulk-derived-control':
+            if self.client_address[0] not in LOCAL_ADDRS:
+                self.send_json({'error':'Derived operator control is local-only'},403)
+                return
+            try:
+                length = int(self.headers.get('Content-Length','0'))
+                if length < 1 or length > 16384 or self.headers.get('Transfer-Encoding') or self.headers.get('Content-Type','').split(';')[0].strip().lower() != 'application/json':
+                    raise ValueError('One bounded derived-operator JSON object is required')
+                self.send_json(BULK_STAGING_RUNTIME.control(self.read_body_json()))
+            except (ValueError,UnicodeError) as error:
+                self.send_json({'error':str(error)},400)
+            except (sqlite3.Error,bulk_derived_staging.Deferred,bulk_derived_staging.PublishUncertain,OSError) as error:
+                self.send_json({'error':str(error),'derivedStatus':BULK_STAGING_RUNTIME.snapshot()},503)
+            return
+
+        if path == '/api/steam-request-control':
+            try:
+                length = int(self.headers.get('Content-Length','0'))
+                if length < 1 or length > 2048 or self.headers.get('Transfer-Encoding') or self.headers.get('Content-Type','').split(';')[0].strip().lower() != 'application/json':
+                    raise ValueError('One small request-control object is required')
+                self.send_json(steam_governor_control(self.read_body_json()))
+            except (ValueError, UnicodeError) as error:
+                self.send_json({'error':str(error)},400)
+            except (sqlite3.Error,steam_request_governor.GovernorError):
+                self.send_json({'error':'Saved Steam request control is unavailable; no request was permitted.'},503)
+            return
+
+        if path == '/api/cash-price-jobs':
+            try:
+                length = int(self.headers.get('Content-Length', '0'))
+                if (length < 1 or length > 2048 or self.headers.get('Transfer-Encoding')
+                        or self.headers.get('Content-Type', '').split(';')[0].strip().lower() != 'application/json'):
+                    raise ValueError('One small JSON object is required')
+                value = cash_price_service().action(self.read_body_json())
+                self.send_json(value, 202 if value.get('accepted') else 200)
+            except cash_prices.CashCooldown as error:
+                self.send_json({'error': str(error), 'provider': cash_prices.PROVIDER,
+                                'retryAt': error.retry_at, 'cooldownReason': error.reason}, 429)
+            except cash_prices.CashError as error:
+                self.send_json({'error': str(error), 'provider': cash_prices.PROVIDER}, error.status)
+            except (ValueError, UnicodeError) as error:
+                self.close_connection = True
+                self.send_json({'error': str(error)}, 400)
+            except sqlite3.Error:
+                self.send_json({'error': 'Cash job storage is unavailable; no completed write is claimed.'}, 503)
+            return
+
+        if path in ('/api/steam-current-ask', '/api/steam-ask-jobs'):
+            try:
+                length = int(self.headers.get('Content-Length', '0'))
+                if (length < 1 or length > 2048 or self.headers.get('Transfer-Encoding')
+                        or self.headers.get('Content-Type', '').split(';')[0].strip().lower() != 'application/json'):
+                    raise ValueError('One small JSON object is required')
+                data = self.read_body_json()
+                if path == '/api/steam-current-ask':
+                    if not isinstance(data, dict) or set(data) != {'marketHashName'}:
+                        raise ValueError('Only marketHashName is accepted')
+                    value = durable_steam_current_ask(validate_market_hash(data['marketHashName']))
+                else:
+                    value = steam_ask_job_action(data)
+                self.send_json(value)
+            except (ValueError, UnicodeError) as error:
+                self.close_connection = True
+                self.send_json({'error': str(error)}, 400)
+            except steam_held_asks.AskJobConflict as error:
+                self.send_json({'error': str(error), 'activeJobId': error.job_id}, 409)
+            except (sqlite3.Error, steam_held_asks.AskSchemaUnavailable):
+                self.send_json({'error': 'Durable Steam ask storage is unavailable; no completed write is claimed.'}, 503)
             return
 
         if path == '/api/logout':
@@ -7762,11 +11160,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not self.require_auth(path, 'DELETE'):
             return
 
-        # Delete is restricted to localhost
-        if not self._is_local():
-            self.send_json({'error': 'Delete is restricted to localhost'}, 403)
-            return
-
         # DELETE /api/snaps/<id>
         if path.startswith('/api/snaps/'):
             snap_id = path.split('/api/snaps/')[1]
@@ -7813,15 +11206,152 @@ def get_lan_ip():
 
 
 # Background refresh and entry point
+def _automatic_refresh_defaults():
+    return {'active': False, 'status': 'idle', 'phase': 'idle',
+            'startedAt': None, 'updatedAt': None, 'finishedAt': None,
+            'source': None, 'windowDays': None, 'receivedRows': 0, 'processedRows': 0,
+            'committedProcessedRows': None, 'commitState': 'not_started',
+            'providerErrors': 0, 'error': None}
+
+
+def automatic_refresh_snapshot():
+    # Scalar-only bounded state; status reads never persist these events.
+    with AUTO_REFRESH_STATUS_LOCK:
+        return {**_automatic_refresh_defaults(), **AUTO_REFRESH_STATUS}
+
+
+def _automatic_refresh_begin():
+    now = int(time.time())
+    with AUTO_REFRESH_STATUS_LOCK:
+        AUTO_REFRESH_STATUS.clear()
+        AUTO_REFRESH_STATUS.update(_automatic_refresh_defaults())
+        AUTO_REFRESH_STATUS.update(active=True, status='running', phase='fetching',
+                                   startedAt=now, updatedAt=now)
+
+
+def automatic_refresh_progress(stage, message, **payload):
+    def count(value):
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+    with AUTO_REFRESH_STATUS_LOCK:
+        if not AUTO_REFRESH_STATUS.get('active'):
+            return
+        state = AUTO_REFRESH_STATUS
+        state['updatedAt'] = int(time.time())
+        if payload.get('source') is not None:
+            state['source'] = str(payload['source'])[:100]
+        if stage == 'provider_fetch':
+            state['phase'] = 'fetching'
+        elif stage == 'provider_received':
+            state['receivedRows'] += count(payload.get('rows'))
+        elif stage == 'provider_error':
+            state['providerErrors'] += 1
+        elif stage == 'waiting_for_writer':
+            state['phase'] = 'waiting_for_writer'
+        elif stage == 'provider_transaction_started':
+            state.update(phase='writing', commitState='uncommitted')
+        elif stage == 'provider_stored':
+            # Includes unchanged valid rows, not a count of new observations.
+            state['processedRows'] += count(payload.get('stored'))
+            state.update(phase='writing', commitState='uncommitted')
+        elif stage == 'rebuilding_metrics':
+            state.update(phase='rebuilding_metrics', source=None,
+                         windowDays=payload.get('windowDays'), commitState='uncommitted')
+        elif stage == 'source_transaction_committed':
+            state.update(phase='derived_pending', source=None, windowDays=None,
+                         commitState='source_committed_derived_pending',
+                         committedProcessedRows=count(payload.get('processedRows')))
+        elif stage == 'provider_transaction_committed':
+            state.update(phase='finishing', source=None, windowDays=None, commitState='committed',
+                         committedProcessedRows=count(payload.get('processedRows')))
+
+
+# Only this pure callback receives progress while the automatic writer is held.
+automatic_refresh_progress._memory_only = True
+
+
+def _automatic_refresh_finish(result=None, error=None):
+    with AUTO_REFRESH_STATUS_LOCK:
+        state = AUTO_REFRESH_STATUS
+        result = result if isinstance(result, dict) else {}
+        state['providerErrors'] = max(state.get('providerErrors', 0), len(result.get('errors') or []))
+        committed = state.get('commitState') in ('committed', 'source_committed_derived_pending')
+        succeeded = error is None and bool(result.get('ok')) and committed
+        now = int(time.time())
+        state.update(active=False, updatedAt=now, finishedAt=now, source=None, windowDays=None)
+        if succeeded:
+            state.update(status='completed_with_errors' if state['providerErrors'] else 'completed',
+                         phase='derived_pending' if state.get('commitState') == 'source_committed_derived_pending' else 'completed', error=None)
+        else:
+            # A later summary failure may follow a successful data commit.
+            # Without the commit event, do not claim the transaction rolled back.
+            if state.get('commitState') == 'uncommitted':
+                state['commitState'] = 'unknown'
+            detail = str(error) if error is not None else str(result.get('error') or 'Automatic refresh did not complete with a confirmed commit.')
+            state.update(status='failed', phase='failed', error=detail[:1000])
+
+
+def run_automatic_market_refresh():
+    _automatic_refresh_begin()
+    try:
+        result = market_universe_bulk_sync('csgotrader', 'any', progress=automatic_refresh_progress)
+    except BaseException as error:
+        _automatic_refresh_finish(error=error)
+        raise
+    _automatic_refresh_finish(result=result)
+    return result
+
+
+def market_refresh_due_from_receipts(receipts, now, interval, automatic=None):
+    """Fetch cadence only: saved local HTTP completion is not quote freshness."""
+    if interval <= 0 or type(now) is not int or now <= 0 or not receipts:
+        return False
+    automatic = automatic if isinstance(automatic, dict) else {}
+    if automatic.get('active'):
+        return False
+    finished = automatic.get('finishedAt')
+    if (automatic.get('status') in ('failed', 'completed_with_errors')
+            and type(finished) is int and 0 < finished <= now
+            and now - finished < max(300, interval)):
+        return False  # Preserve this process's existing error/rate-limit sleep.
+    sources = {'steam_snapshot':'steam', 'csfloat':'csfloat', 'buff163':'buff163',
+               'youpin':'youpin', 'skinport':'skinport'}
+    clocks = []
+    for provider, receipt in receipts.items():
+        if provider not in sources or not isinstance(receipt, dict):
+            continue
+        fetched = receipt.get('fetchedAt')
+        digest = receipt.get('contentSHA256')
+        received, valid = receipt.get('receivedRows'), receipt.get('validRows')
+        if (type(receipt.get('version')) is int and receipt['version'] == 1
+                and receipt.get('provider') == provider
+                and receipt.get('source') == 'csgotrader:' + sources[provider]
+                and receipt.get('fetchReceiptState') == 'last_successful_fetch'
+                and type(fetched) is int and 0 < fetched <= now
+                and isinstance(digest, str) and re.fullmatch(r'[0-9a-f]{64}', digest)
+                and type(received) is int and type(valid) is int and 0 <= valid <= received):
+            clocks.append(fetched)
+    # Missing/old/malformed provenance permits the ordinary initial/expired pull;
+    # never replace it with a global quote scan or an inferred success clock.
+    return not clocks or now - max(clocks) >= interval
+
+
 def market_refresh_is_due():
     if MARKET_REFRESH_INTERVAL_SECONDS <= 0:
         return False
-    with db() as conn:
-        latest = conn.execute(
-            """SELECT MAX(updated_at) FROM market_item_prices
-               WHERE provider IN ('steam_snapshot','csfloat','buff163','skinport','youpin')"""
-        ).fetchone()[0] or 0
-    return int(time.time()) - int(latest or 0) >= MARKET_REFRESH_INTERVAL_SECONDS
+    automatic = automatic_refresh_snapshot()
+    if automatic.get('active'):
+        return False
+    sources = csgotrader_sources()
+    with closing(steam_ask_db()) as conn:
+        conn.execute('BEGIN')
+        receipts = {('steam_snapshot' if source == 'steam' else source):
+                    provider_fetch_receipt(conn, 'steam_snapshot' if source == 'steam' else source)
+                    for source in sources}
+    return market_refresh_due_from_receipts(receipts, int(time.time()),
+                                            MARKET_REFRESH_INTERVAL_SECONDS, automatic)
 
 
 def background_market_refresh_loop():
@@ -7830,7 +11360,7 @@ def background_market_refresh_loop():
         try:
             time.sleep(60)
             if market_refresh_is_due():
-                market_universe_bulk_sync('csgotrader', 'any')
+                run_automatic_market_refresh()
         except Exception as exc:
             print('  Market background refresh failed:', exc)
         time.sleep(max(300, MARKET_REFRESH_INTERVAL_SECONDS))
@@ -7874,9 +11404,28 @@ if __name__ == '__main__':
         sys.exit(1)
 
     init_db()
+    # Version-one research keeps its original handlers and cached-history data.
+    # Current cash prices use the same portable entry point and a separate ledger.
+    import restoration_runtime
+    restoration_runtime.install(sys.modules[__name__])
+    start_idle_wal_anchor()
+    try:
+        BULK_STAGING_RUNTIME.restore()
+    except (sqlite3.Error,bulk_derived_staging.Deferred,ValueError,OSError) as error:
+        print('  Saved derived continuation unavailable:',error)
     purge_expired_sessions()
-    resumed_data_task = resume_persisted_data_task()
-    start_background_tasks()
+    # Reconcile old provider leases before any resumed/automatic Steam work.
+    try:
+        steam_ask_reconcile_startup()
+    except (sqlite3.Error, steam_held_asks.AskSchemaUnavailable):
+        pass  # Every network entry retries this guard and remains fail-closed.
+    # Never revive a retired large research job merely by starting the restored
+    # server. Explicit dashboard tasks remain available with shared admission.
+    resumed_data_task = False
+    if os.environ.get('CS2DASH_RESUME_RESEARCH_TASKS', '0').strip().lower() in ('1', 'true', 'yes'):
+        resumed_data_task = resume_persisted_data_task()
+    if os.environ.get('CS2DASH_RESEARCH_AUTO_REFRESH', '0').strip().lower() in ('1', 'true', 'yes'):
+        start_background_tasks()
     ip = get_lan_ip()
 
     print()
@@ -7891,15 +11440,42 @@ if __name__ == '__main__':
     if resumed_data_task:
         print('  Data:    resumed persisted data update task')
     print()
-    print('  Note: Delete operations are restricted to localhost.')
+    print('  Note: Write and delete operations require sign-in.')
     print('  Press Ctrl+C to stop.')
     print()
 
+    # Resume only a previously explicit durable job; absent schema does no work.
+    try:
+        with closing(steam_ask_db()) as ask_conn:
+            steam_held_asks.require_schema(ask_conn)
+        if not getattr(sys.modules[__name__], 'PRICE_PIPELINE', None):
+            STEAM_HELD_ASK_WORKER.kick()
+    except (sqlite3.Error, steam_held_asks.AskSchemaUnavailable):
+        pass
     server = http.server.ThreadingHTTPServer((BIND_HOST, PORT), Handler)
     try:
-        server.serve_forever()
+        CASH_PRICE_CADENCE.start()
+        stop_file = os.environ.get('CS2DASH_STOP_FILE')
+        if stop_file:
+            marker = Path(stop_file).resolve()
+            server.timeout = 1
+            while not marker.exists():
+                server.handle_request()
+        else:
+            server.serve_forever()
     except KeyboardInterrupt:
         print('\n  Stopped.')
+    finally:
+        if not stop_data_tasks():
+            print('  Explicit data task is closing its bounded source unit; saved task state is retained.')
+        server.server_close()
+        if not CASH_PRICE_CADENCE.stop():
+            print('  Cash cadence stopping at its closed-unit boundary; no new cycles admitted.')
+        BULK_STAGING_RUNTIME.stop()
+        STEAM_HELD_ASK_WORKER.stop()
+        if CASH_PRICE_HOLDINGS_CACHE is not None:
+            CASH_PRICE_HOLDINGS_CACHE.close()
+        close_idle_wal_anchor()
 
 
 

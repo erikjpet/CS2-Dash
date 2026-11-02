@@ -1,5 +1,27 @@
 # cs2dash
 
+Version **1.0.1** restores the published v1.0 research interface and data paths while retaining the later normalized current-cash pricing work. The verified historical baseline and complete control matrix are in [docs/V1-BASELINE.md](docs/V1-BASELINE.md) and [docs/V1-PARITY-MATRIX.md](docs/V1-PARITY-MATRIX.md).
+
+The Items view has two explicit bases: **Provider benchmark research** and **Current cash listings**. Research uses cached provider snapshots and genuine dated history; cash values use qualified, fresh listing quotes. Their prices, period movements and coverage are not interchangeable. Global item filters and sorting run before the bounded result page, and Previous/Next controls reach subsequent pages.
+
+The application uses Python 3.12+ and SQLite. Current public-price transports also require Node on PATH, or an absolute `CS2_CASH_NODE` executable path. No third-party Python packages are required. Existing inventory, settings and local note/preset storage keys are retained.
+
+Both research and cash paths start with the existing `server.py` entry point. `CS2DASH_DATA_DIR` selects personal/research state; its separate `prices-current.sqlite` ledger is retained, or `CS2DASH_QUOTE_DB` can select an existing ledger. Startup never overwrites an existing quote ledger. Cash acquisition uses its saved provider pacing; original research refresh jobs remain explicit unless `CS2DASH_RESEARCH_AUTO_REFRESH=1` or `CS2DASH_RESUME_RESEARCH_TASKS=1` is deliberately configured.
+
+`/api/health` reports version and code identity. `/api/research-capabilities` distinguishes implemented features from saved data, provider admission and acquisition prerequisites. Missing historical observations remain unavailable; current quotes are never used to manufacture a past curve. See [the offline recovery procedure](docs/RESEARCH-RECOVERY.md) for additive recovery from retained research archives without replacing personal data.
+
+## Restoration validation
+
+```sh
+python -m unittest discover -s tests -p 'test_*.py' -v
+python -m unittest discover -s tools -p 'test_*.py' -v
+node --test tools/frontend_restore.test.mjs
+```
+
+These tests use invented temporary data. They exercise actual research/current API contracts, scope and period calculations, whole-catalog filtering/paging, authentication, null-safe import/export, shared Steam cooldowns, recovery safety and complete-script UI rendering. Browser acceptance and live provider checks are separate qualification stages; source tests alone do not establish a live deployment.
+
+The original v1.0 usage and research contract follow below. References to Steam/provider benchmark values describe the research basis; current cash listings are shown separately.
+
 Version 1.0 local-first dashboard for Counter-Strike 2 portfolio valuation, full-market analysis, provider price comparison, and collection-level trend research.
 
 ## What It Does
@@ -59,7 +81,8 @@ After code changes, restart the server and hard refresh the browser. To run cs2d
 
 ## Requirements
 
-- Python 3.8 or newer (standard library only — no third-party packages)
+- Python 3.12 or newer (standard library only - no third-party Python packages)
+- Node on PATH (or `CS2_CASH_NODE`) for the current public cash-price transports
 - Network access for catalog and market refreshes
 - A login password via `CS2DASH_AUTH_PASSWORD_HASH` (or `CS2DASH_AUTH_PASSWORD` for dev), unless `CS2DASH_AUTH_DISABLE=1`
 - Optional `STEAM_COOKIE` environment variable for reliable Steam chart-history requests that need an authenticated session
@@ -197,7 +220,7 @@ The cold-sync check uses a temporary empty database, pulls CSGO Trader provider 
 
 ## Security
 
-cs2dash includes single-user login. All pages and API calls require a session cookie; unauthenticated API requests get `401` and page loads redirect to `/login`.
+cs2dash includes single-user login. By default, protected pages and API calls require a session cookie; unauthenticated API requests get `401` and page loads redirect to `/login`. `CS2DASH_PUBLIC_READONLY=1` permits only the cached-data GET allowlist without signing in. Write operations still require authentication, and anonymous reads cannot force a provider refresh.
 
 - Set a password before exposing the app: generate a hash with `python server.py --hash-password` and provide it via `CS2DASH_AUTH_PASSWORD_HASH` (username via `CS2DASH_AUTH_USER`, default `admin`).
 - The server refuses to start if auth is enabled but no password is configured. For a trusted local network only, you may disable auth with `CS2DASH_AUTH_DISABLE=1`.

@@ -1,0 +1,7 @@
+# Keep deployed code fingerprints stable across Windows and Linux checkouts.
+*.py text eol=lf
+*.mjs text eol=lf
+*.html text eol=lf
+*.sql text eol=lf
+*.sh text eol=lf
+*.md text eol=lf

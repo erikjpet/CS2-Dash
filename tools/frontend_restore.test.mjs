@@ -1,0 +1,226 @@
+/** Source / synthetic-fixture acceptance only. No browser, service, network or real portfolio data. */
+import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
+import test from 'node:test';
+import vm from 'node:vm';
+
+const source=readFileSync(new URL('../index.html',import.meta.url),'utf8');
+const markup=source.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi,'');
+function fn(name){
+ const m=new RegExp('^[\\t ]*(?:async[\\t ]+)?function[\\t ]+'+name+'\\s*\\(','m').exec(source);
+ assert.ok(m,`function ${name} exists`);let end=source.indexOf('}',m.index);
+ while(end>=0){const body=source.slice(m.index,end+1);try{new vm.Script('('+body+'\n)');return body;}catch(e){if(!(e instanceof SyntaxError))throw e;}end=source.indexOf('}',end+1);}
+ assert.fail(`function ${name} does not parse`);
+}
+function run(names,expression,globals={}){return new vm.Script(names.map(fn).join('\n')+'\n'+expression).runInNewContext(globals,{timeout:3000});}
+const IDX={n:0,q:1,pct:2,d:3,ct:4,pt:5,cat:6,grp:7};
+
+test('all inline scripts compile without running the dashboard',()=>{
+ for(const script of source.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/g))new vm.Script(script[1]);
+});
+test('historical controls and canvas shells are mounted, current additions retained',()=>{
+ const ids=['snap-select','global-scale','data-task-mode','data-pull-mode','data-history-limit','data-task-cycles','data-retry-failures','data-task-start-btn','overview-curve-days','warm-portfolio-history-btn','decision-note','ov-return-split','ov-return-top','ov-return-bottom','bk-vol-thin','bk-vol-min-price','bk-vol-min-coverage','bk-sort-value','bk-sort-dollar','bk-sort-pct','bk-sort-vol7','bk-sort-vol30','bk-sort-vol90','bk-sort-count','bk-sort-name','market-bk-vol-thin','market-bk-vol-min-price','market-bk-vol-min-coverage','market-bk-sort-value','market-bk-sort-dollar','market-bk-sort-pct','market-bk-sort-vol7','market-bk-sort-vol30','market-bk-sort-vol90','market-bk-sort-count','market-bk-sort-name','items-mode-market','items-mode-portfolio','items-basis','item-search','item-coll-filter','item-type-filter','item-grade-filter','item-min-price','item-max-price','item-preset-name','item-preset-icon','file-input','paste-input','snap-label','portfolio-cash-panel','current-decision-summary','current-observed-curve','current-market-sources','history-observed-curve'];
+ for(const id of ids)assert.match(markup,new RegExp('id="'+id+'"'));
+ for(const id of ['pie-chart','rollup-bar','overview-curve-chart','overview-sector-return-chart','bk-chart-value','bk-chart-return','market-bk-chart-value','market-bk-chart-return','trend-chart'])assert.match(markup,new RegExp('<canvas\\b[^>]*id="'+id+'"'));
+ assert.doesNotMatch(markup,/<select[^>]*id="global-scale"[^>]*\bhidden/);
+ assert.doesNotMatch(fn('renderCurrentSources'),/legacyControls\.hidden\s*=\s*true/);
+});
+test('static controls have unique IDs',()=>{
+ const ids=[...markup.matchAll(/\bid="([^"]+)"/g)].map(m=>m[1]);
+ assert.equal(new Set(ids).size,ids.length);
+});
+test('restored research reads and separate current decision endpoint are wired',()=>{
+ assert.match(fn('requestInventoryAnalytics'),/fetch\('\/api\/inventory/);
+ assert.match(fn('requestInventoryAnalytics'),/indexInventoryAnalytics/);
+ assert.match(fn('buildBreakdown'),/loadTaxonomyAnalysis\('portfolio'/);
+ assert.match(fn('buildMarketAnalysis'),/loadTaxonomyAnalysis\('market'/);
+ assert.match(fn('requestCurrentAnalysis'),/\/api\/current-analysis\?portfolio=/);
+ assert.match(fn('startDataTask'),/method:\s*'POST'/);
+ assert.match(fn('startDataTask'),/\/api\/data-tasks/);
+ assert.match(fn('pollDataTasks'),/\/api\/data-tasks/);
+});
+test('public readonly portfolio curve uses cached GET without acquisition flags',async()=>{
+ let captured='';
+ const globals={_readonly:true,_portfolioCurveKey:'',_portfolioCurveLoading:false,_portfolioCurveRequestId:0,_savedReadGeneration:0,_globalScale:90,active:{id:'SYNTHETIC',data:{}},document:{getElementById:id=>id==='overview-curve-days'?{value:'90'}:{classList:{contains:()=>false}}},fetch:async url=>{captured=url;return {ok:true,json:async()=>({ok:true,points:[],coverage:{}})};},updateWarmPortfolioStatusFromCoverage(){}};
+ await run(['requestPortfolioCurve'],'requestPortfolioCurve({refresh:true,forceSteam:true,force:true})',globals);
+ const query=new URL(captured,'https://synthetic.invalid');assert.equal(query.pathname,'/api/portfolio-history');assert.equal(query.searchParams.has('refresh'),false);assert.equal(query.searchParams.has('force'),false);
+});
+
+test('portfolio warm and sync controls submit selected tracked history jobs',async()=>{
+ for(const control of ['warmPortfolioHistory','syncPortfolioSteamData']){
+  const requests=[];const elements={};
+  const globals={Object,JSON,_readonly:false,_steamSyncRunning:false,_portfolioHistoryTask:null,
+   _dataTasksUnsupported:false,_dataTaskPolling:false,_lastDataTaskId:'',active:{id:'SYNTHETIC-SELECTED'},
+   document:{getElementById:id=>(elements[id]??={value:'',checked:true,disabled:false})},
+   setWarmPortfolioStatus(){},renderMarketDataStatus(){},renderDataTasks(){},
+   renderPortfolioHistoryTask(data){globals._portfolioHistoryTask=data.task;},
+   fetch:async(url,options)=>{requests.push({url,...options});const payload=JSON.parse(options.body);return{ok:true,status:200,json:async()=>({ok:true,task:{id:'SYNTHETIC-JOB',mode:'steam_history',status:'queued',options:payload}})};},
+   requestPortfolioCurve(){assert.fail('A button must not invoke one-shot curve acquisition');},
+   syncMarketUniverseData(){assert.fail('Portfolio history must not fall back to unrelated market work');}};
+  await run(['startDataTask','queuePortfolioHistoryTask','warmPortfolioHistory','syncPortfolioSteamData'],control+'()',globals);
+  assert.equal(requests.length,1);assert.equal(requests[0].url,'/api/data-tasks');assert.equal(requests[0].method,'POST');
+  const body=JSON.parse(requests[0].body);assert.equal(body.mode,'steam_history');assert.equal(body.portfolio,'SYNTHETIC-SELECTED');
+  assert.equal(body.historyScope,'portfolio');assert.equal(body.historyLimit,control==='warmPortfolioHistory'?80:250);
+  assert.equal(body.historyAll,control==='syncPortfolioSteamData');assert.equal(body.force,false);assert.equal(body.cycles,1);
+  assert.equal(globals._lastDataTaskId,'SYNTHETIC-JOB');
+ }
+});
+
+test('portfolio history waiting status stays tracked and completion only reloads cached curve',()=>{
+ const elements={},messages=[],reads=[];
+ const globals={active:{id:'SYNTHETIC-SELECTED'},_portfolioHistoryTask:null,_portfolioHistoryRefreshKey:'',_steamSyncRunning:false,
+  document:{getElementById:id=>(elements[id]??={disabled:false,textContent:''})},
+  setWarmPortfolioStatus:(message,state)=>messages.push({message,state}),exactTime:value=>'synthetic-time-'+value,
+  invalidateSavedReadCaches(){},requestPortfolioCurve:options=>reads.push(options)};
+ const task={id:'SYNTHETIC-JOB',mode:'steam_history',status:'waiting',message:'Saved provider deadline',progress:{retryAt:123},options:{historyScope:'portfolio',portfolio:'SYNTHETIC-SELECTED'}};
+ globals.payload={active:task};run(['renderPortfolioHistoryTask'],'renderPortfolioHistoryTask(payload)',globals);
+ assert.equal(messages.at(-1).state,'loading');assert.match(messages.at(-1).message,/SYNTHETIC-JOB: waiting/);
+ assert.equal(elements['warm-portfolio-history-btn'].disabled,true);assert.equal(reads.length,0);
+ globals.payload={tasks:[{...task,status:'complete',message:'Data task complete'}]};
+ run(['renderPortfolioHistoryTask'],'renderPortfolioHistoryTask(payload);renderPortfolioHistoryTask(payload)',globals);
+ assert.equal(messages.at(-1).state,'ready');assert.equal(elements['steam-sync-btn'].disabled,false);
+ assert.equal(reads.length,1);assert.equal(reads[0].force,true);assert.equal(reads[0].refresh,undefined);assert.equal(reads[0].forceSteam,undefined);
+ globals.active={id:'SYNTHETIC-OTHER'};
+ run(['renderPortfolioHistoryTask'],'renderPortfolioHistoryTask(payload)',globals);
+ assert.equal(globals._portfolioHistoryTask,null);assert.equal(globals._steamSyncRunning,false);
+});
+test('both item bases send true sort, bounds and page offset before server limit',()=>{
+ for(const basis of ['research','cash'])for(const sort of ['latestPrice','source','latestAt']){
+  const values={'item-search':'SYNTHETIC','item-coll-filter':'','item-type-filter':'','item-grade-filter':'','item-min-price':'1000','item-max-price':'10000'};
+  const globals={URLSearchParams,_itemsBasis:basis,_marketItemsOffset:500,_globalScale:90,_searchTerms:[],_blTerms:[],_sortKey:sort,_sortDir:-1,document:{getElementById:id=>({value:values[id]})}};
+  const url=new URL(run(['marketItemsQueryState','marketItemsUrl'],'marketItemsUrl()',globals),'https://fixture.invalid');
+  assert.equal(url.pathname,basis==='cash'?'/api/current-market-items':'/api/market-items');
+  assert.equal(url.searchParams.get('sort'),sort);assert.equal(url.searchParams.get('min_price'),'1000');assert.equal(url.searchParams.get('max_price'),'10000');assert.equal(url.searchParams.get('offset'),'500');assert.equal(url.searchParams.get('limit'),'500');
+ }
+});
+test('research and current item renderers stay explicitly separate',()=>{
+ assert.match(fn('buildItemsTab'),/buildCashItemsTab/);assert.match(fn('buildItemsTab'),/buildResearchItemsTab/);
+ for(const role of ['changePct','changeDollar','steamPrice','steamPremiumPct','csfloatPrice','buffPrice','priorPrice','volatility7','volatility30','volatility90'])assert.match(fn('buildResearchItemsTab'),new RegExp("itemSortHeader\\('"+role+"'"));
+ assert.match(fn('sortAndRenderResearchItems'),/steam-history-box/);
+ assert.match(fn('buildCashItemsTab'),/canonical|Cash price/);
+ assert.match(fn('sortAndRenderCashItemsWithinHoldingsScope'),/canonicalItemCells/);
+});
+test('research and cash headlines cannot overwrite each other',()=>{
+ assert.doesNotMatch(fn('applySteamSummary'),/getElementById\('s-curr'\)/);
+ assert.match(fn('applySteamSummary'),/s-benchmark-curr/);
+ assert.match(fn('renderCanonicalHeadline'),/s-curr/);
+ assert.match(markup,/Provider benchmark valuation/);
+ assert.match(markup,/separate from current cash/);
+});
+test('missing research prior values are not flat-filled from current quotes',()=>{
+ assert.doesNotMatch(fn('steamOverviewData'),/if\s*\(past === null\)\s*past = curr/);
+ assert.doesNotMatch(fn('steamOverviewData'),/pct \|\| 0, dollar \|\| 0, curr, past \|\| 0/);
+ assert.match(fn('steamOverviewData'),/r\.pct = r\.history === r\.count/);
+ const summary=run(['finiteNum','steamSummaryForData'],'steamSummaryForData({items:[["SYNTHETIC",1]]})',{IDX,analyticsForItem:()=>({marketCurr:12,marketPast:null})});
+ assert.equal(summary.baseline,0);assert.equal(summary.baselineFilled,0);assert.equal(summary.past,null);assert.equal(summary.dollar,null);assert.equal(summary.pct,null);
+ const group=run(['finiteNum','breakdownRow'],'breakdownRow(fixture)',{fixture:{name:'SYNTHETIC',count:1,priced:1,currentValue:12,priorValue:null,avgChangePct:null,avgVolatilityPct:null}});
+ assert.equal(group.avgItemPct,null);assert.equal(group.volatility,null);assert.equal(group.prior,null);
+ const panel={style:{}};
+ run(['finiteNum','renderPortfolioCurveConfidence'],'renderPortfolioCurveConfidence({items:2,itemsWithHistory:0,backfilledCurrentItems:0},true)',{document:{getElementById:()=>panel}});
+ assert.match(panel.innerHTML,/missing raw history stays unavailable/);
+ assert.doesNotMatch(panel.innerHTML,/current-price backfilled/);
+});
+test('nullable TXT export round-trips exact synthetic identities and quantities',()=>{
+ const items=Array.from({length:12},(_,i)=>['SYNTHETIC '+i+' | Quoted "name", Ω',i+1,null,null,null,null,'Synthetic','Synthetic']);
+ const result=run(['finiteNum','snapshotExportText','parseTextFormat'],`(()=>{const text=snapshotExportText(fixture);return {text,rows:parseTextFormat(text)};})()`,{IDX,fixture:{data:{items}}});
+ assert.ok(result.text.startsWith('CS2Dash holdings export v2'));assert.match(result.text,/N\/A/);assert.equal(result.rows.length,items.length);
+ result.rows.forEach((row,i)=>{assert.equal(row.name,items[i][0]);assert.equal(row.qty,items[i][1]);assert.equal(row.curr,null);assert.equal(row.past,null);assert.equal(row.pct,null);assert.equal(row.dollar,null);});
+ assert.match(fn('exportSnap'),/const text=snapshotExportText\(snap\)/);
+});
+test('numeric TXT benchmark export retains unit values and signs',()=>{
+ const result=run(['finiteNum','snapshotExportText','parseTextFormat'],'parseTextFormat(snapshotExportText(fixture))',{IDX,fixture:{data:{items:[['SYNTHETIC',3,-12.5,-7.5,52.5,60,'x','x']]}}});
+ assert.equal(result[0].qty,3);assert.equal(result[0].curr,17.5);assert.equal(result[0].past,20);assert.equal(result[0].pct,-12.5);assert.equal(result[0].dollar,-7.5);
+});
+test('CSV import handles LF/CRLF, quoted commas/escaped quotes and unknown financial fields',()=>{
+ for(const newline of ['\n','\r\n']){
+  const lines=['Item Name,Amount,Past Price,Current Price,Return %,Return',...Array.from({length:10},(_,i)=>`"SYNTHETIC ${i}, ""Ω""",2,N/A,,N/A,`)];
+  const rows=run(['parseCSVRows','parseCSVFormat'],'parseCSVFormat(fixture)',{fixture:lines.join(newline)});
+  assert.equal(rows.length,10);assert.equal(rows[0].name,'SYNTHETIC 0, "Ω"');assert.equal(rows[0].qty,2);assert.equal(rows[0].curr,null);assert.equal(rows[0].past,null);
+ }
+});
+test('latest historical duplicate import fix remains functional',()=>{
+ const raw=[{name:'SYNTHETIC',qty:2,past:10,curr:12,pct:20,dollar:4},{name:'SYNTHETIC',qty:2,past:10,curr:12,pct:20,dollar:4},{name:'SYNTHETIC',qty:3,past:20,curr:24,pct:20,dollar:12},{name:'BAD',qty:0}];
+ const result=run(['importNumber','importWeightedAvg','importExactKey','normalizeImportRows'],'normalizeImportRows(fixture)',{fixture:raw,cleanText:v=>String(v??'').trim()});
+ assert.equal(result.items.length,1);assert.equal(result.items[0].qty,5);assert.equal(result.stats.exactDuplicates,1);assert.equal(result.stats.mergedRows,1);assert.equal(result.stats.invalidRows,1);
+});
+test('advanced filter disclosure is not forcibly collapsed by every response',()=>{
+ assert.match(fn('updateItemsModeControls'),/!advanced\.dataset\.initialized/);
+ assert.match(fn('buildMarketItemsTab'),/updateMarketPagination\(\)/);
+ assert.match(markup,/id="items-page-previous"/);assert.match(markup,/id="items-page-next"/);
+});
+test('notes and preset keys are preserved, basis added to captured state',()=>{
+ assert.match(source,/DECISION_NOTE_KEY\s*=\s*'cs2dash_decision_note_v1'/);
+ assert.match(source,/ITEM_PRESET_STORAGE_KEY\s*=\s*'cs_item_filter_presets_v1'/);
+ assert.match(fn('captureCurrentItemFilters'),/basis:\s*_itemsBasis/);
+ assert.match(fn('applyItemFilterState'),/filters\.basis==='cash'/);
+ assert.match(fn('hydrateDecisionNote'),/localStorage\.getItem\(DECISION_NOTE_KEY\)/);
+});
+test('cash rendering indexes holdings once while preserving mutation detection outside render scope',()=>{
+ assert.doesNotMatch(fn('canonicalHoldingValue'),/\.find\(/);
+ const n=1600,rows=Array.from({length:n},(_,i)=>['SYNTHETIC '+i,1]);let maps=0;
+ const originalMap=rows.map.bind(rows);rows.map=(...args)=>{maps++;return originalMap(...args);};
+ const globals={IDX,active:{id:'synthetic',data:{items:rows}},canonicalAcceptedHoldingsCache:null,canonicalHoldingsRenderScope:null,canonicalCashState:{revision:'synthetic'},portfolioCashState:{value:{items:rows.map(row=>({displayName:row[0],qty:1,valueUsd:1}))},acceptedRevision:'synthetic',holdingsKey:JSON.stringify(['synthetic',rows.map(row=>[row[0],row[1]])])},canonicalHoldingsBodyReusable:()=>true,canonicalQuote:()=>({}),canonicalHoldingQuoteMatches:()=>true};
+ maps=0;
+ const result=run(['finiteNum','portfolioCashHoldingsKey','withCanonicalHoldingsScope','canonicalHoldingValue'],`(()=>{let result;withCanonicalHoldingsScope(()=>{for(let i=0;i<1000;i++)result=canonicalHoldingValue('SYNTHETIC 0',1);});return result;})()`,globals);
+ assert.equal(result,1);assert.equal(maps,1);
+ rows[0][1]=2;
+ const changed=run(['finiteNum','portfolioCashHoldingsKey','withCanonicalHoldingsScope','canonicalHoldingValue'],"canonicalHoldingValue('SYNTHETIC 0',1)",globals);
+ assert.equal(changed,null);
+ assert.doesNotMatch(fn('sortItems'),/\n\s*sortAndRender\(\);/);
+});
+test('restored tables scroll locally rather than clipping fields on mobile',()=>{
+ assert.match(source,/\.item-table-wrap\{overflow-x:auto/);
+ assert.match(source,/\.card:has\(\.pulse-table\),#bk-table-wrap,#market-bk-table-wrap\{overflow-x:auto/);
+ assert.match(source,/\.header-center\{flex-wrap:wrap;min-width:0\}/);
+ assert.match(source,/\.snap-info h3[^}]*overflow-wrap:anywhere/);
+});
+
+test('complete inline script renders research Overview, Items and both group scopes with synthetic DOM/data',async()=>{
+ const elements=new Map(),chartKinds=[];
+ function element(id=''){
+  const classes=new Set();let content='';
+  const el={id,style:{},dataset:{},value:'',checked:false,hidden:false,disabled:false,options:[],parentElement:null,
+   classList:{add:n=>classes.add(n),remove:n=>classes.delete(n),contains:n=>classes.has(n),toggle:(n,v)=>v?classes.add(n):classes.delete(n)},
+   addEventListener(){},removeEventListener(){},setAttribute(){},getAttribute(){return null;},querySelector(){return null;},querySelectorAll(){return [];},appendChild(){},getContext(){return {};},focus(){},getBoundingClientRect(){return {left:0,right:100,top:0,bottom:100,width:100,height:100};},
+  };
+  Object.defineProperty(el,'innerHTML',{get:()=>content,set:value=>{content=String(value);for(const m of content.matchAll(/\bid="([^"]+)"/g))if(!elements.has(m[1]))elements.set(m[1],element(m[1]));}});
+  return el;
+ }
+ for(const m of markup.matchAll(/\bid="([^"]+)"/g))elements.set(m[1],element(m[1]));
+ elements.get('tab-overview').classList.add('active');
+ const document={hidden:false,body:{classList:{toggle(){}}},getElementById:id=>elements.get(id)||null,querySelector:selector=>selector==='.section.active'?elements.get('tab-overview'):null,querySelectorAll:()=>[],createElement:()=>element(),addEventListener(){}};
+ class Chart {static defaults={font:{}};constructor(canvas,config){chartKinds.push(config.type);}destroy(){}update(){}}
+ const fakeFetch=async()=>({ok:true,status:200,json:async()=>({})});
+ const window={fetch:fakeFetch,location:{href:'https://synthetic.invalid/'},addEventListener(){},innerWidth:1280,innerHeight:900};
+ const context=vm.createContext({document,window,fetch:fakeFetch,URL,URLSearchParams,AbortController,Chart,localStorage:{getItem:()=>null,setItem(){},removeItem(){}},setTimeout:()=>1,clearTimeout(){},setInterval:()=>1,clearInterval(){},console:{warn(){},error(){},log(){}},Intl,Date});
+ const app=[...source.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/g)].map(m=>m[1]).join('\n').replace(/^init\(\);$/m,'/* explicit startup omitted in synthetic smoke */').replace(/^loadBlacklist\(\);$/m,'/* no shared settings reads */');
+ new vm.Script(app).runInContext(context,{timeout:3000});
+ const formatted=new vm.Script(`({missing:fmt(null),bad:fmt(Infinity),zero:fmt(0),missingDelta:fmtD(null),zeroDelta:fmtD(0),missingPct:fmtP(null),badPct:fmtP(NaN),zeroPct:fmtP(0)})`).runInContext(context);
+ assert.equal(formatted.missing,'Unavailable');assert.equal(formatted.bad,'Unavailable');assert.equal(formatted.zero,'$0');assert.equal(formatted.missingDelta,'Unavailable');assert.equal(formatted.zeroDelta,'+$0');assert.equal(formatted.missingPct,'Unavailable');assert.equal(formatted.badPct,'Unavailable');assert.equal(formatted.zeroPct,'+0.00%');
+ new vm.Script(`
+ const syntheticRows=Array.from({length:12},(_,i)=>['SYNTHETIC '+i,1,null,null,null,null,'Synthetic','Synthetic']);
+ active={id:'synthetic',label:'Synthetic fixture',data:{items:syntheticRows,totals:{curr:null,past:null,dollar:null,count:12},categories:[],rollup:[],topGainers:[],topLosers:[]}};snaps=[active];
+ _inventoryAnalytics=Object.fromEntries(syntheticRows.map(row=>[row[0],{name:row[0],marketCurr:12,marketPast:10,marketUnitPrice:12,marketPriorUnitPrice:10,marketDollar:2,marketPct:20,providerPrices:{},hasPrior:true}]));
+ _portfolioCurve={ok:false,points:[],error:'Synthetic raw history unavailable'};
+ requestPortfolioCurve=async()=>{};loadTaxonomyAnalysis=async()=>({dimensions:[],coverage:{}});
+ renderOverview(active.data);buildItemsTab(active.data);
+ `).runInContext(context,{timeout:3000});
+ assert.ok(chartKinds.includes('doughnut'));assert.ok(chartKinds.includes('bar'));
+ assert.match(elements.get('items-container').innerHTML,/Provider benchmark/);
+ assert.match(elements.get('items-tbody').innerHTML,/SYNTHETIC/);
+ new vm.Script(`processText(snapshotExportText(active),'SYNTHETIC holdings.txt')`).runInContext(context,{timeout:3000});
+ assert.match(elements.get('parse-preview').innerHTML,/Imported benchmark value \(not current cash\)/);
+ assert.match(elements.get('parse-preview').innerHTML,/Unavailable/);
+ assert.doesNotMatch(elements.get('parse-preview').innerHTML,/\$0/);
+ await new vm.Script(`(async()=>{
+ loadTaxonomyAnalysis=async(scope)=>{
+  var data={scope:scope,coverage:{},dimensions:['collection','type','event'].map(dimension=>({dimension:dimension,leaders:[{dimension:dimension,name:'SYNTHETIC GROUP',count:1,priced:1,currentValue:12,priorValue:10,priorCoverageItems:1,weightedChangePct:20,changeDollar:2,avgChangePct:null,avgVolatilityPct:null,topMovers:[],topVolatile:[]}]}))};
+  if(scope==='market')_taxonomyMarketData=data;else _taxonomyPortfolioData=data;return data;
+ };
+ await buildBreakdown(active.data);await buildMarketAnalysis();
+ })()`).runInContext(context,{timeout:3000});
+ assert.match(elements.get('bk-table-wrap').innerHTML,/SYNTHETIC GROUP/);
+ assert.match(elements.get('market-bk-table-wrap').innerHTML,/SYNTHETIC GROUP/);
+ assert.match(elements.get('bk-table-wrap').innerHTML,/portfolio holdings/);
+ assert.match(elements.get('market-bk-table-wrap').innerHTML,/one-each basket/);
+});
