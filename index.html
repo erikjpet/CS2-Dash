@@ -3449,6 +3449,7 @@ function setItemsMode(mode) {
   if (_itemsMode === mode) return;
   cancelMarketItemsRequest();
   clearTimeout(_marketFilterTimer);
+  _marketFilterTimer = null;
   releaseItemHistoryViews();
   _itemsMode = mode; _marketItemsOffset=0;
   _sortKey = mode === 'market' ? (_itemsBasis==='cash'?'latestPrice':'movementScore') : 'ct';
@@ -3612,6 +3613,11 @@ function renderItemPresets() {
 
 function updateItemsModeControls() {
   var isMarket = _itemsMode === 'market';
+  var container = document.getElementById('items-container');
+  if (!isMarket) {
+    clearTimeout(_marketFilterTimer); _marketFilterTimer = null;
+    if (container) container.setAttribute('aria-busy', 'false');
+  }
   var pBtn = document.getElementById('items-mode-portfolio');
   var mBtn = document.getElementById('items-mode-market');
   if (pBtn) pBtn.classList.toggle('active', !isMarket);
@@ -4824,6 +4830,8 @@ function populateMarketItemFilters(rows, options) {
 }
 
 async function buildMarketItemsTab(force) {
+  clearTimeout(_marketFilterTimer);
+  _marketFilterTimer = null;
   var requestedKey = marketItemsQueryKey();
   updateItemsModeControls();
   var container = document.getElementById('items-container');
@@ -4839,7 +4847,9 @@ async function buildMarketItemsTab(force) {
   if (!hasRenderedTable) container.innerHTML = '<div class="empty-msg" role="status">Loading saved market items...</div>';
   else renderMarketDataStatus(null, {loading:true, message:'Keeping the current market rows visible while loading the best matches for the active filters.'});
   try {
-    var rows = await loadMarketItems(force);
+    var pendingRead = loadMarketItems(force);
+    var requestId = _marketItemsRequestId;
+    var rows = await pendingRead;
     if (_itemsMode !== 'market' || requestedKey !== marketItemsQueryKey()) return;
     populateMarketItemFilters(rows, _marketItemFilters);
     existingTable = document.getElementById('items-table');
@@ -4889,7 +4899,9 @@ container.innerHTML = '<div class="item-table-wrap"><table id="items-table" clas
     else renderMarketDataStatus(null, {error:true, message:'Market slice failed; keeping the previous rows visible: '+e.message});
     if (count) count.textContent = hasRenderedTable ? 'Update failed — previous results shown' : 'Market load failed — adjust filters to retry';
   } finally {
-    if (!_marketItemsLoading) { container.setAttribute('aria-busy', 'false'); updateMarketPagination(); }
+    if (_itemsMode === 'market' && requestId === _marketItemsRequestId && !_marketItemsLoading && _marketFilterTimer === null) {
+      container.setAttribute('aria-busy', 'false'); updateMarketPagination();
+    }
   }
 }
 
@@ -5024,9 +5036,13 @@ function clearItemFilters() {
 function scheduleMarketItemsReload(delay) {
   clearTimeout(_marketFilterTimer);
   cancelMarketItemsRequest();
+  _marketItemsKey = '';
+  var container = document.getElementById('items-container');
+  if (container) container.setAttribute('aria-busy', 'true');
   var count = document.getElementById('item-count');
   if (count) count.textContent = 'Updating market filters...';
   _marketFilterTimer = setTimeout(function(){
+    _marketFilterTimer = null;
     buildMarketItemsTab(false);
   }, delay == null ? 250 : delay);
 }
@@ -8347,6 +8363,7 @@ function createResearchChart(canvas,config){
 }
 function setItemsBasis(value){
   _itemsBasis=value==='cash'?'cash':'research';_marketItemsOffset=0;
+  clearTimeout(_marketFilterTimer);_marketFilterTimer=null;
   cancelMarketItemsRequest();_marketItemsKey='';_marketItemsCache.clear();releaseItemHistoryViews();
   _sortKey=_itemsMode==='market'?(_itemsBasis==='cash'?'latestPrice':'movementScore'):'ct';_sortDir=-1;
   document.getElementById('items-container').innerHTML='';buildItemsTab(active && active.data || {items:[]});

@@ -148,6 +148,76 @@ test('advanced filter disclosure is not forcibly collapsed by every response',()
  assert.match(fn('buildMarketItemsTab'),/updateMarketPagination\(\)/);
  assert.match(markup,/id="items-page-previous"/);assert.match(markup,/id="items-page-next"/);
 });
+test('debounced market reads are pending immediately and stale reads cannot clear their busy owner',async()=>{
+ const elements=new Map(),timers=new Map();let nextTimer=1,builds=0;
+ const el=id=>{if(!elements.has(id))elements.set(id,{textContent:'',innerHTML:'',attributes:{'aria-busy':'false'},setAttribute(name,value){this.attributes[name]=value;},classList:{contains:()=>true}});return elements.get(id);};
+ const globals={_marketFilterTimer:null,_marketItemsRequestId:0,_marketItemsKey:'same-query',_marketItemsLoading:false,_itemsMode:'market',_itemsBasis:'research',_marketItems:[{name:'Synthetic'}],_marketItemFilters:{},_filtered:[],
+  document:{getElementById:el},marketItemsQueryKey:()=>globals.query||'same-query',
+  cancelMarketItemsRequest(){globals._marketItemsLoading=false;},clearTimeout:id=>timers.delete(id),setTimeout:callback=>{const id=nextTimer++;timers.set(id,callback);return id;},
+  updateItemsModeControls(){},populateMarketItemFilters(){},sortAndRenderMarketItems(){},renderMarketDataStatus(){},updateMarketPagination(){},esc:String,
+  buildMarketItemsTab:()=>{builds++;}};
+ run(['scheduleMarketItemsReload'],'scheduleMarketItemsReload()',globals);
+ assert.equal(globals._marketItemsKey,'');assert.equal(el('items-container').attributes['aria-busy'],'true');assert.ok(globals._marketFilterTimer);
+ const firstTimer=globals._marketFilterTimer;run(['scheduleMarketItemsReload'],'scheduleMarketItemsReload()',globals);
+ assert.equal(timers.has(firstTimer),false);assert.equal(timers.size,1);
+ const pending=globals._marketFilterTimer;timers.get(pending)();assert.equal(globals._marketFilterTimer,null);assert.equal(builds,1);
+ for(const newer of ['timer','query','loading','normalized-query','none']){
+  let finish;globals.query='same-query';globals._marketFilterTimer=null;globals._marketItemsLoading=false;
+  globals.loadMarketItems=()=>new Promise(resolve=>{finish=resolve;});
+  const read=run(['buildMarketItemsTab'],'buildMarketItemsTab(false)',globals);
+  if(newer==='timer')globals._marketFilterTimer=987;
+  if(newer==='query'){globals.query='new-query';globals._marketItemsRequestId++;}
+  if(newer==='normalized-query')globals.populateMarketItemFilters=()=>{globals.query='normalized-query';};
+  else globals.populateMarketItemFilters=()=>{};
+  if(newer==='loading')globals._marketItemsLoading=true;
+  finish([{name:'Synthetic'}]);await read;
+  assert.equal(el('items-container').attributes['aria-busy'],['none','normalized-query'].includes(newer)?'false':'true',newer);
+ }
+});
+test('queued market filter is canceled when a saved portfolio preset changes scope directly',async()=>{
+ const h=presetReplayHarness(),g=h.context,timers=new Map();let nextTimer=1,marketBuilds=0;
+ Object.assign(g,{_itemsMode:'market',_itemsBasis:'research',_marketFilterTimer:null,_marketItemsLoading:false,
+  setTimeout:callback=>{const id=nextTimer++;timers.set(id,callback);return id;},clearTimeout:id=>timers.delete(id),
+  updateMarketPagination(){},buildMarketItemsTab(){marketBuilds++;}});
+ const getElement=g.document.getElementById;
+ g.document.getElementById=id=>{const el=getElement(id);el.attributes??={};el.setAttribute=(name,value)=>{el.attributes[name]=value;};el.classList??={};el.classList.toggle??=()=>{};el.dataset??={};el.style??={};return el;};
+ new vm.Script(['scheduleMarketItemsReload','updateItemsModeControls'].map(fn).join('\n')).runInContext(g);
+ g.scheduleMarketItemsReload();assert.ok(g._marketFilterTimer);assert.equal(timers.size,1);
+ g.preset={mode:'portfolio',basis:'research',searchText:'Alpha'};await g.selectItemPreset('SYNTHETIC-PRESET');
+ assert.equal(g._itemsMode,'portfolio');assert.equal(g._marketFilterTimer,null);assert.equal(timers.size,0);assert.equal(marketBuilds,0);assert.equal(h.elements.get('items-container').attributes['aria-busy'],'false');assert.deepEqual(h.rows(),['Alpha']);
+});
+test('research portfolio and full-market details load exact raw history and apply actual window datasets',async()=>{
+ for(const mode of ['portfolio','market']){
+  const elements=new Map(),requests=[],draws=[],identity={name:'Synthetic display',hash:'Synthetic exact listing'};
+  const el=id=>{if(!elements.has(id))elements.set(id,{id,style:{display:'none'},value:'90',innerHTML:'',textContent:'',setAttribute(){},getContext(){return {canvas:this};}});return elements.get(id);};
+  const tbody=el('items-tbody');let rendered='';
+  Object.defineProperty(tbody,'innerHTML',{get:()=>rendered,set:html=>{rendered=String(html);for(const match of rendered.matchAll(/\bid="([^"]+)"/g))el(match[1]);}});
+  const analytics={marketUnitPrice:20,marketPriorUnitPrice:10,marketCurr:40,marketPast:20,marketPct:100,marketDollar:20,marketPriceSource:'market_snapshot',marketQuoteProvider:'steam_snapshot',providerPrices:{steam_snapshot:{price:20},csfloat:{price:18},buff163:{price:17}}};
+  const globals={IDX,Date,Map,AbortController,Number,ACCENT:'gold',_itemsMode:mode,_itemsBasis:'research',_sortKey:'name',_sortDir:1,_marketItemsTotal:1,_steamHistoryCharts:{},_steamHistoryLoading:{},_steamHistoryCache:new Map(),
+   _filtered:mode==='portfolio'?[[identity.name,2,null,null,null,null,'Synthetic category','Synthetic type']]:[{name:identity.name,marketHashName:identity.hash,latestPrice:20,priorPrice:10,providerPrices:analytics.providerPrices,groups:['Synthetic group']}],
+   document:{getElementById:el},refreshItemSortHeaders(){},installResearchControlSemantics(){},updateBlacklistCount(){},
+   itemMeta:()=>({marketHashName:identity.hash,type:'Synthetic type',rarity:'Covert',collection:'Synthetic collection'}),analyticsForItem:()=>analytics,quoteFor:()=>null,
+   steamMetricForItem:(_,key)=>analytics[key],findCollection:()=>'',findEvent:()=>'',compactMetaText:()=>'',itemThumbHtml:()=>'',marketItemThumbHtml:()=>'',
+   esc:value=>String(value??''),dispName:String,baseName:String,marketSourceLabel:String,exactAge:()=>'',moneyOrDash:value=>String(value??'--'),pctOrDash:value=>String(value??'--'),deltaOrDash:value=>String(value??'--'),clr:()=>'',volColor:()=>'',volText:value=>String(value??'--'),volatilityWindowValue:()=>null,volatilityCellHtml:()=>'<td>--</td>',steamPremiumSignal:()=>null,steamPremiumCellHtml:()=>'',steamPremiumColor:()=>'',providerPriceHtml:()=>'<div>Provider fixtures</div>',
+   savedDataStateMessage:()=>'',setTimeout:()=>1,clearTimeout(){},
+   createResearchChart:(canvas,config)=>{draws.push(config);return {destroy(){}};},
+   fetch:async url=>{requests.push(url);return {ok:true,json:async()=>({points:[{ts:100*86400,price:20},{ts:10*86400,price:5},{ts:95*86400,price:18}],source:'steam_history',updatedAt:100*86400})};}};
+  const functions=['finiteNum','providerPrice','marketItemType','stableDomId','historyWindowSelectHtml','historyDateLabel','cacheRead','cacheWrite','sortAndRenderResearchItems','sortAndRenderResearchMarketItems','toggleResearchItemDetail','loadSteamHistoryForRow'];
+  const context=vm.createContext(globals);new vm.Script(functions.map(fn).join('\n')).runInContext(context);
+  new vm.Script(mode==='portfolio'?'sortAndRenderResearchItems()':'sortAndRenderResearchMarketItems()').runInContext(context);
+  assert.match(rendered,/Provider Comps/);assert.match(rendered,/Provider Prices/);assert.match(rendered,/steam-history-box/);assert.match(rendered,/data-market="Synthetic exact listing"/);
+  const rowId=new vm.Script(`stableDomId('${mode==='portfolio'?'irow-':'mrow-'}','Synthetic display')`).runInContext(context);
+  const row=el(rowId);row.querySelector=selector=>selector==='.steam-history-box'?{getAttribute:attribute=>attribute==='data-name'?identity.name:identity.hash}:null;
+  new vm.Script(`toggleResearchItemDetail('${rowId}')`).runInContext(context);await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(row.style.display,'');assert.equal(requests.length,1);
+  const url=new URL(requests[0],'https://synthetic.invalid');assert.equal(url.pathname,'/api/history');assert.equal(url.searchParams.get('name'),identity.name);assert.equal(url.searchParams.get('hash'),identity.hash);assert.equal(url.searchParams.has('refresh'),false);
+  assert.deepEqual(Array.from(draws.at(-1).data.datasets[0].data),[5,18,20]);
+  el(rowId+'-history-days').value='7';await context.loadSteamHistoryForRow(rowId,true);
+  assert.deepEqual(Array.from(draws.at(-1).data.datasets[0].data),[18,20]);
+  el(rowId+'-history-days').value='0';await context.loadSteamHistoryForRow(rowId,true);
+  assert.deepEqual(Array.from(draws.at(-1).data.datasets[0].data),[5,18,20]);assert.equal(requests.length,1,'Window changes reuse the exact saved history response');
+ }
+});
 test('notes and preset keys are preserved, basis added to captured state',()=>{
  assert.match(source,/DECISION_NOTE_KEY\s*=\s*'cs2dash_decision_note_v1'/);
  assert.match(source,/ITEM_PRESET_STORAGE_KEY\s*=\s*'cs_item_filter_presets_v1'/);

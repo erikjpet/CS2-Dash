@@ -44,7 +44,7 @@ const ready=async()=>{
  await page.waitForFunction(()=>active&&active.id&&active.data&&Array.isArray(active.data.items),null,{timeout:10000});
 };
 const inventorySettled=()=>page.waitForFunction(()=>active&&!_inventoryAnalyticsLoading&&_inventoryAnalyticsKey===active.id+':'+_globalScale,null,{timeout:10000});
-const marketSettled=()=>page.waitForFunction(()=>_itemsMode!=='market'||(!_marketItemsLoading&&_marketItemsKey===marketItemsQueryKey()&&document.getElementById('items-container').getAttribute('aria-busy')!=='true'),null,{timeout:10000});
+const marketSettled=()=>page.waitForFunction(()=>_itemsMode!=='market'||(_marketFilterTimer===null&&!_marketItemsLoading&&_marketItemsKey===marketItemsQueryKey()&&document.getElementById('items-container').getAttribute('aria-busy')!=='true'),null,{timeout:10000});
 const advanced=async id=>{
  await marketSettled();
  const details=page.locator('#items-advanced-filters');
@@ -140,11 +140,31 @@ register('IT-01/10/11/14/16','Research/cash bases in both portfolio and catalog 
   assert.ok(headers.includes(basis==='research'?'Provider benchmark':'Cash price'));
   if(basis==='research')assert.ok(headers.includes('Move %')&&headers.includes('CSFloat'));
   assert.ok(await page.locator('#items-tbody .item-main-row').count()>0);
-  await page.locator('#items-tbody .item-main-row').first().click();
-  const detail=page.locator('#items-tbody .item-detail-row:visible').first();await detail.waitFor({state:'visible'});
-  if(basis==='research')assert.ok(await detail.locator('.steam-history-box').count()>0);
-  else await detail.locator('[data-current-sources]').waitFor({state:'attached'});
-  evidence.push({basis,mode,expandedDetail:true});
+    const first=page.locator('#items-tbody .item-main-row').first();
+    const rowId=await first.evaluate(row=>row.nextElementSibling.id);
+    const detail=page.locator('#'+rowId);
+    let historyRead;
+    if(basis==='research'){
+     const identity=await detail.locator('.steam-history-box').evaluate(box=>({name:box.getAttribute('data-name'),hash:box.getAttribute('data-market')}));
+     historyRead=page.waitForResponse(response=>{const url=new URL(response.url());return url.origin===base.origin&&url.pathname==='/api/history'&&url.searchParams.get('name')===identity.name&&url.searchParams.get('hash')===identity.hash;});
+    }
+    await first.click();await detail.waitFor({state:'visible'});
+    if(basis==='research'){
+     const response=await historyRead;assert.ok(response.ok());const history=await response.json();assert.ok(history.points?.length>1);
+     await page.waitForFunction(id=>!!Chart.getChart(document.getElementById(id+'-history-chart')),rowId);
+     const chartState=()=>page.evaluate(id=>{const chart=Chart.getChart(document.getElementById(id+'-history-chart'));return {points:chart.data.datasets[0].data.length,first:chart.data.datasets[0].data[0],last:chart.data.datasets[0].data.at(-1)};},rowId);
+     const ninety=await chartState();assert.ok(ninety.points>1);
+     await detail.locator('select[id$="-history-days"]').selectOption('7');
+     await page.waitForFunction(id=>{const chart=Chart.getChart(document.getElementById(id+'-history-chart'));return !_steamHistoryLoading[id]&&!!chart&&chart.data.datasets[0].data.length>1&&document.getElementById(id+'-history-days').value==='7';},rowId);
+     const seven=await chartState();assert.ok(seven.points<ninety.points,'7d must narrow the actual history dataset');
+     await detail.locator('select[id$="-history-days"]').selectOption('0');
+     await page.waitForFunction(({id,count})=>{const chart=Chart.getChart(document.getElementById(id+'-history-chart'));return !_steamHistoryLoading[id]&&chart?.data.datasets[0].data.length===count;},{id:rowId,count:history.points.length});
+     const all=await chartState();assert.equal(all.points,history.points.length);
+     evidence.push({basis,mode,expandedDetail:true,exactHistoryRead:true,historyPoints:{ninety:ninety.points,seven:seven.points,all:all.points},realChartDrawn:true});
+    }else{
+     await detail.locator('[data-current-sources]').waitFor({state:'attached'});
+     evidence.push({basis,mode,expandedDetail:true,currentSourcesVisible:true});
+    }
  }
  return {combinations:evidence};
 });

@@ -67,3 +67,18 @@ state on loopback8098 with provider network disabled; it must prove a clean exit
 closed listener, matching code identity, intact temporary databases and zero
 provider attempts. Each phase retains its own owned-job and cleanup receipt.
 Neither phase changes the existing live service or promotes user data.
+
+## UI02 and the remaining single-case qualification
+
+Normal startup/stop passed on exact `9ed207c`. UI02 passed B1/B7/B9/B12 and
+failed B6 while a queued market filter reload could replace an expanded row.
+The research history markup and request/window dataflow were already present;
+the prepared correction makes queued work pending immediately and cancels it
+when scope or basis changes. An old completion cannot clear a newer busy state.
+
+Use `CS2_V1_BROWSER_CASES=6` for the next bounded run. It awaits the debounce,
+targets the exact detail row, verifies the exact `/api/history` response and
+real Chart datasets for 90 days, 7 days and All in both research scopes, and
+opens both cash detail views. Retain all earlier evidence and source identities;
+this selected run does not represent a complete twelve-case rerun. Provider
+acquisition remains disabled and all fixture data remain invented.
