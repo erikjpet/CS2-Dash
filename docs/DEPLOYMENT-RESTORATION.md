@@ -1,8 +1,36 @@
 # CS2-04 restoration cutover
 
-This is a deployment design and checklist, prepared 2026-11-02. No cutover,
-process stop, provider request or data promotion was performed to write it.
-The root integration worker owns execution and the final private receipts.
+The authorized CS2-only cutover completed on 2026-11-02. Exact tested source
+`07d21ec5f912ce70eb90a6505764df1d9025216e` is active at the existing
+`http://192.168.0.36:8089/` with unchanged bind/access policy. The root integration
+worker retains the private execution receipts. The procedure below records the
+boundaries used and remains guidance for any later controlled replacement.
+
+## Execution result
+
+- Original host: normal stop and closed listener confirmed at 22:43:55 UTC.
+- State: one fresh working clone from the closed originals, zero redundant
+  full-database backups. Original source/data retained; unique state, complete
+  current ledger and both database integrity checks passed. Additive research
+  recovery retained the original observation dates.
+- Activation: tested source started at 22:48:21 UTC. All 43 runtime files and
+  served frontend bytes matched on localhost and LAN. Only CS2 restarted;
+  existing credential paths were reused without copying credentials.
+- Live acceptance: all 20 cached-GET checks passed, including identity,
+  personal-state preservation, both valuation bases/scopes, market ordering and
+  reports. Authenticated CSFloat captured fresh data after restart.
+- Steam: one normal selected-item history job followed a canonical redirect,
+  waited for its persisted admission deadline and completed with 2,408 genuine
+  points and zero failures. Cached history reads succeeded; the history fetch
+  did not freshen the wallet quote capture time. `STEAM_COOKIE` is empty, so
+  authenticated Steam history remains unqualified.
+- Live browser: LIVE01 passed all four item basis/scope details and 390/768 mobile
+  geometry, with zero page errors or mutation attempts. A grouping-row wait
+  timed out and remains under focused triage. The owned job released with zero
+  processes at 22:58:30 UTC; the persistent CS2 service remained running.
+- Remaining: narrow live grouping acceptance, wider history coverage and
+  unexercised parity subflows. Full v1 parity is not yet complete. No rollback
+  was performed; any future rollback must preserve post-start writes.
 
 The application entry point after cutover is
 `D:/Projects/site/vendor/CS2-Dash/server.py` on the existing port **8089**.
@@ -23,26 +51,26 @@ Push the upstream immediately after the guarded integration; verify both remote
 main identities. Publication is separate from the explicit CS2-only cutover.
 Do not run generic sync against the current dirty Windows vendor directory.
 
-- [ ] Record the final tested and pushed **CS2-Dash main commit** and the site
+- [x] Record the final tested and pushed **CS2-Dash main commit** and the site
   integration main commit. Save the expected build-identity object from the exact
   deployed root files (`build_identity.capture`); do not substitute a branch name
   or the old v1 baseline commit for the new release identity.
-- [ ] Preserve the deployed-only source, current runtime profile, relevant CS2
+- [x] Preserve the deployed-only source, current runtime profile, relevant CS2
   launcher hunks and private launch configuration outside Git. Retain the existing
   preservation backups; they are rollback evidence, not final promotion inputs.
-- [ ] Verify the actual 8089 listener PID, executable, command/source path, data
+- [x] Verify the actual 8089 listener PID, executable, command/source path, data
   path and current quote-ledger path in the deployment host context.
   Match process creation identity as well as PID before acting. PID files
   `dev-cs2.pid` and `cs2dev.pid` are hints, not ownership proof.
-- [ ] Identify the CS2-only refresher named by `dev-cs2-refresh.pid` and any
+- [x] Identify the CS2-only refresher named by `dev-cs2-refresh.pid` and any
   confirmed CS2 supervisor that could restart it or the old host. Record its
   source/creation identity and how to prevent restart during cutover.
-- [ ] Resolve a new, empty, private destination for the **final** data clone and
+- [x] Resolve a new, empty, private destination for the **final** data clone and
   the retained derived database/archive accepted by `research_recovery.py`.
   Record those resolved paths and hashes in a private receipt. An older
   `candidate02` or rehearsal clone must never replace current personal state.
-- [ ] Confirm sufficient disk space for the two backups, research recovery and
-  rollback retention. Acquisition enforces a 10 GiB free-space floor on both
+- [x] Confirm sufficient disk space for one working clone, research recovery and
+  retained originals. Acquisition enforces a 10 GiB free-space floor on both
   application and quote-ledger volumes. Validate the runtime profile's Python
   executable/hash and SQLite `deserialize` support; resolve the existing Node
   executable required by cash transports without invoking any provider.
@@ -55,10 +83,11 @@ Keep exact process IDs, creation times and ownership observations in a local
 deployment receipt. Recheck ownership immediately before action; a prior
 observation is insufficient to identify a future process reusing a PID.
 
-The root wrapper checks `DATA_DIR/lean-current.json` and delegates to
-`lean_runtime.serve`; the live frontend/source is consequently `lean_host/app`.
-That loader chooses `dataDirectory/prices-current.sqlite` when present, rather
-than the older fallback cash path supplied by the wrapper.
+The **pre-cutover** root wrapper checked `DATA_DIR/lean-current.json` and
+delegated to `lean_runtime.serve`, serving `lean_host/app`. That loader chose
+`dataDirectory/prices-current.sqlite` when present. The activated portable root
+`server.py` installs the restored runtime directly; it does not delegate back to
+the retained lean host.
 
 Reconfirm effective live settings privately. Preserve the data directory,
 listener address, authentication, public-readonly access and cookie policy,
@@ -98,29 +127,29 @@ it is not a CS2-only cutover controller.
    completion and process exit. Verify 8089 is unbound. If ownership, closure or
    the deadline is uncertain, stop the cutover and diagnose; do not kill a PID
    solely because it occurs in a saved file.
-4. With **all CS2 writers now closed**, take a fresh read-only SQLite online
-   backup of the actual main database and actual current quote ledger into a
-   new private backup directory. Use `mode=ro` + `Connection.backup`, then
-   `quick_check` on each destination. Do not copy a SQLite main file while
-   omitting its WAL, change the live journal mode or checkpoint the live source.
-   The online-backup API is appropriate even after the writer has stopped.
+4. With **all CS2 writers now closed**, retain the original data directory and
+   make one new working clone using read-only SQLite online backup. Use
+   `mode=ro` + `Connection.backup`, then `quick_check` on each destination.
+   The retained closed originals provide rollback state; an extra full backup
+   directory is not required. Do not copy a SQLite main file while omitting its
+   WAL, change the original journal mode or checkpoint the original source.
 5. Copy existing companion `portfolios.json`, `settings.json`, `snaps.json` and
    any explicitly required runtime configuration after that same writer boundary.
-   Retain all unknown runtime files in the backup; do not discard or activate
+   Retain all unknown runtime files in the originals; do not discard or activate
    sidecars by guessing. Record counts and canonical row digests privately for
    personal tables, saved identity resolutions, settings, auth/session state,
    catalog and real raw history. Record ledger revision, capture/provenance,
    leases, retry deadlines and provider activation unchanged.
-6. Create the new isolated main database from that **final backup** with the
+6. Create the new isolated main database from the **closed original** with the
    recovery helper, then plan/apply additive research recovery:
 
    ```text
-   python research_recovery.py clone --source <final-backup-main> --target <new-data>/cs2dash.sqlite
+   python research_recovery.py clone --source <closed-original-main> --target <new-data>/cs2dash.sqlite
    python research_recovery.py plan --target <new-data>/cs2dash.sqlite --derived <retained-derived> --archive <retained-archive>
    python research_recovery.py apply --target <new-data>/cs2dash.sqlite --derived <retained-derived> --archive <retained-archive>
    ```
 
-   Copy the freshly backed-up current quote ledger into the new data directory
+   Clone the closed original current quote ledger into the new data directory
    as `prices-current.sqlite` using a consistent SQLite backup, and copy the
    companion personal JSON files. Keep all originals untouched. Do not launch
    the application between clone and apply: the helper requires its unchanged
@@ -134,8 +163,8 @@ it is not a CS2-only cutover controller.
    synthesized, and no current ledger is modified by recovery.
 8. Verify the recovered clone's quick check, four-table counts, FTS and receipt
    source hashes/date ranges. Compare all personal/settings/identity/catalog/
-   raw-history invariants to the final backup, and the complete current ledger
-   to its final backup. Existing current-feature schema must already be present;
+   raw-history invariants to the closed originals, and the complete current
+   ledger schema/content to its closed original. Existing current-feature schema must already be present;
    `restoration_runtime.install` deliberately refuses an existing incompatible
    ledger rather than migrating or replacing it implicitly.
 
@@ -198,7 +227,7 @@ cutover smoke test.
 | --- | --- |
 | Listener/audience | New owned PID is the sole 8089 listener; bind, LAN URL and existing access policy agree with preflight; unrelated services remain running. |
 | Build | `/api/health` version, `build.sourceRevision`, runtime/frontend/server hashes and file count match the exact deployed root code. Served `/` bytes hash matches `frontendSha256`; a supplied revision alone is not byte proof. |
-| Personal state | `/api/portfolios` selected identities/quantities and settings equal final-backup invariants; no synthetic fixture marker or test portfolio exists. |
+| Personal state | `/api/portfolios` selected identities/quantities and settings equal closed-original invariants; no synthetic fixture marker or test portfolio exists. |
 | Current basis | `/api/current-analysis?portfolio=<existing-id>` and `/api/canonical-cash-value?portfolio_id=<existing-id>` agree on held scope, basis, coverage and quote revision. `/api/current-market-items` selects quotes from that same canonical ledger. Allow normal time-based staleness; never relabel a preserved old capture fresh. |
 | Research basis | `/api/inventory?portfolio=<existing-id>`, `/api/market-items`, `/api/market-universe` and portfolio/market `/api/taxonomy-analysis` use recovered dated research, with one-each market scope separate from held quantities. Price bounds/sort precede pagination. |
 | Provenance/history | `/api/research-capabilities` and recovered response date/coverage fields expose saved dated metrics and actual raw-history availability. Empty genuine raw history stays unavailable; archive apply time is not market observation time. |
@@ -240,17 +269,24 @@ service stopped and report the exact remaining prerequisite.
 ## Remaining execution prerequisites
 
 The targeted process-description read succeeded in the approved host context.
-There is no unresolved approval request. Ownership still needs its immediate
-pre-stop recheck, and final source/archive identities and supervisor/refresher
-closure need execution evidence.
+The authorized activation, normal original-host closure, fresh working clone,
+additive recovery, source/profile promotion and restart have completed. Final
+source identity and twenty cached-GET live checks passed. This completed
+execution does not authorize acting on a saved process identity in a later run;
+recheck ownership immediately before any future process action.
 
 The restored root `server.py` supports `CS2DASH_STOP_FILE` as well as console
 `KeyboardInterrupt`, and closes explicit tasks, the server and coordinator in
-`finally`. Qualify that configured marker on the owned candidate process before
-rollback depends on it. A saved PID and `Stop-Process` alone do not prove graceful
-closed-unit shutdown.
+`finally`. CS2STOP02 qualified that configured marker on exact `9ed207c` with
+empty invented state and providers disabled: exit0, closed listener, valid main
+and ledger databases and zero owned processes. Its backend code is unchanged
+in browser-qualified and activated `07d21ec`. The original live writer closed
+normally during this cutover. The new live process has not been stopped again;
+a future stop still requires its current ownership and closure evidence.
 
-The final backup, recovery, profile update, restart, post-start write-safe rollback
-qualification and live acceptance are all **pending execution**, not completed
-by this document. Retained archive paths and any post-start personal-state merge
-mechanism are explicit controller inputs, not guessed by this checklist.
+The LIVE01 grouping timeout, wider history coverage and unexercised parity
+subflows remain pending. Live details and 390/768 geometry passed; preserve those
+results while triaging only the grouping issue. A post-start rollback has not been executed or
+qualified; preserve the latest accepted state before any future rollback.
+Retained archive paths and any necessary post-start personal-state reconciliation
+remain explicit controller inputs, not guessed by this checklist.

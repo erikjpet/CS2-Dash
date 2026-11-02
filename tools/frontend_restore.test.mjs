@@ -84,6 +84,75 @@ test('portfolio history waiting status stays tracked and completion only reloads
  run(['renderPortfolioHistoryTask'],'renderPortfolioHistoryTask(payload)',globals);
  assert.equal(globals._portfolioHistoryTask,null);assert.equal(globals._steamSyncRunning,false);
 });
+
+function taxonomyCompletionHarness(scope){
+ const elements=new Map(),requests=[],renders=[],statuses=[];
+ const visibleTab=scope==='market'?'tab-market':'tab-categories';
+ const el=id=>{if(!elements.has(id))elements.set(id,{id,innerHTML:'',textContent:'',disabled:false,style:{},classList:{contains:()=>id===globals.visibleTab}});return elements.get(id);};
+ const globals={visibleTab,active:{id:'Synthetic A',data:{items:[['Synthetic holding',1]]}},_globalScale:90,_savedReadGeneration:0,_portfolioHistoryTask:null,_portfolioHistoryRefreshKey:'',_steamSyncRunning:false,
+  _portfolioCurveRequestId:0,_portfolioCurve:null,_portfolioCurveKey:'',_portfolioCurveLoading:false,_portfolioCurveWarmPending:false,_taxonomyHistoryCache:{},_taxonomyPortfolioData:null,_taxonomyPortfolioKey:'',_taxonomyMarketData:null,_taxonomyMarketKey:'',_marketAnalysis:null,_marketBkData:null,_bkData:null,
+  _marketItemsCache:new Map(),_steamHistoryCache:new Map(),_marketItemsKey:'',_marketItemsWindowKey:'',_marketDetails:{},_steamHistoryLoading:{},_inventoryAnalyticsKey:'',
+  document:{getElementById:el},invalidateCanonicalCashReads(){},cancelMarketItemsRequest(){},cancelInventoryAnalyticsRequest(){},setWarmPortfolioStatus(){},requestPortfolioCurve(){},exactTime:()=>'',esc:String,renderOverviewTaxonomyPanels(){},
+  buildModernBreakdownDataset:data=>({marker:data.marker}),renderModernBreakdown:which=>renders.push({scope:which,marker:(which==='market'?globals._marketBkData:globals._bkData).marker}),
+  renderMarketDataStatus:(data,options)=>statuses.push(options),
+  fetch:url=>new Promise(resolve=>requests.push({url,resolve})),
+ };
+ const context=vm.createContext(globals);
+ new vm.Script(['researchPeriodDays','taxonomyScopeKey','renderPortfolioHistoryTask','invalidateSavedReadCaches','loadTaxonomyAnalysis','buildBreakdown','buildMarketAnalysis'].map(fn).join('\n')).runInContext(context);
+ const complete=(id='Synthetic history 1')=>context.renderPortfolioHistoryTask({tasks:[{id,mode:'steam_history',status:'complete',options:{historyScope:'portfolio',portfolio:context.active.id}}]});
+ const respond=(index,marker,ok=true)=>requests[index].resolve({ok,status:ok?200:503,json:async()=>({marker,dimensions:[{dimension:'collection',leaders:[{name:'Synthetic group'}]}]})});
+ const build=()=>scope==='market'?context.buildMarketAnalysis():context.buildBreakdown(context.active.data);
+ return {context,elements,requests,renders,statuses,complete,respond,build};
+}
+
+test('completed history invalidation retries an in-flight visible taxonomy once for both scopes',async t=>{
+ for(const scope of ['portfolio','market'])await t.test(scope,async()=>{
+  const h=taxonomyCompletionHarness(scope),read=h.build();assert.equal(h.requests.length,1);
+  h.complete();assert.equal(h.context._savedReadGeneration,1);h.respond(0,'old generation');await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(h.requests.length,2,scope+' must replace its invalidated visible read');assert.equal(h.renders.length,0);
+  h.respond(1,'current generation');await read;
+  assert.deepEqual(h.renders,[{scope,marker:'current generation'}]);assert.equal(h.context[scope==='market'?'_taxonomyMarketData':'_taxonomyPortfolioData'].marker,'current generation');
+  h.complete();assert.equal(h.context._savedReadGeneration,1,'Repeated polls of one completion do not keep invalidating the read');
+ });
+});
+
+test('a completed history job for another portfolio does not invalidate current taxonomy',async()=>{
+ for(const scope of ['portfolio','market']){
+  const h=taxonomyCompletionHarness(scope),read=h.build();
+  h.context.renderPortfolioHistoryTask({tasks:[{id:'Other synthetic history',mode:'steam_history',status:'complete',options:{historyScope:'portfolio',portfolio:'Synthetic B'}}]});
+  assert.equal(h.context._savedReadGeneration,0);h.respond(0,'unaffected generation');await read;
+  assert.equal(h.requests.length,1);assert.deepEqual(h.renders,[{scope,marker:'unaffected generation'}]);
+ }
+});
+
+test('taxonomy retry respects changed portfolio/window/visibility and remains bounded on repeated completion',async t=>{
+ for(const scope of ['portfolio','market'])for(const change of ['portfolio','window','hidden','repeated','http'])await t.test(scope+'/'+change,async()=>{
+  const h=taxonomyCompletionHarness(scope),read=h.build();
+  if(change==='http'){h.respond(0,'unavailable',false);await read;assert.equal(h.requests.length,1);assert.match(h.elements.get(scope==='market'?'market-loading':'bk-table-wrap').innerHTML,/failed: HTTP 503/);return;}
+  h.complete();
+  if(change==='portfolio')h.context.active={id:'Synthetic B',data:{items:[['Other synthetic holding',1]]}};
+  if(change==='window')h.context._globalScale=7;
+  if(change==='hidden')h.context.visibleTab='tab-items';
+  h.respond(0,'stale generation');await new Promise(resolve=>setImmediate(resolve));
+  if(change==='repeated'){
+   assert.equal(h.requests.length,2);h.complete('Synthetic history 2');h.respond(1,'stale again');await read;
+   assert.equal(h.requests.length,2,'A second invalidation must not create an unbounded retry loop');assert.match(h.elements.get(scope==='market'?'market-loading':'bk-table-wrap').innerHTML,/Saved analysis changed again/);
+  }else{
+   await read;assert.equal(h.requests.length,1);assert.doesNotMatch(h.elements.get(scope==='market'?'market-loading':'bk-table-wrap').innerHTML,/failed:/);
+  }
+  assert.equal(h.renders.length,0);assert.equal(h.context[scope==='market'?'_taxonomyMarketData':'_taxonomyPortfolioData'],null);
+ });
+});
+
+test('an older taxonomy retry cannot overwrite a newer builder after its fresh render',async()=>{
+ for(const scope of ['portfolio','market']){
+  const h=taxonomyCompletionHarness(scope),older=h.build();h.complete();h.respond(0,'old first read');await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(h.requests.length,2);h.complete('Synthetic history 2');const newer=h.build();assert.equal(h.requests.length,3);
+  h.respond(2,'newer current data');await newer;h.respond(1,'older invalidated retry');await older;
+  assert.equal(h.requests.length,3);assert.deepEqual(h.renders,[{scope,marker:'newer current data'}]);
+  assert.doesNotMatch(h.elements.get(scope==='market'?'market-loading':'bk-table-wrap').innerHTML,/failed:|Saved analysis changed again/);
+ }
+});
 test('both item bases send true sort, bounds and page offset before server limit',()=>{
  for(const basis of ['research','cash'])for(const sort of ['latestPrice','source','latestAt']){
   const values={'item-search':'SYNTHETIC','item-coll-filter':'','item-type-filter':'','item-grade-filter':'','item-min-price':'1000','item-max-price':'10000'};

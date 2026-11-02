@@ -7030,7 +7030,9 @@ function sortMarketBkView(key, btn){
   renderModernBreakdown('market');
 }
 
-async function buildBreakdown(data){
+async function buildBreakdown(data, retriedStale){
+  var requestId = buildBreakdown.requestId = (buildBreakdown.requestId || 0) + 1;
+  var requestKey = taxonomyScopeKey('portfolio');
   var el = document.getElementById('bk-table-wrap');
   if (!data || !data.items || !data.items.length) {
     if (el) el.innerHTML = '<div class="empty-msg">Import item data to see category analysis.</div>';
@@ -7041,16 +7043,26 @@ async function buildBreakdown(data){
   }
   try {
     var taxonomy = await loadTaxonomyAnalysis('portfolio', false);
+    if (requestId !== buildBreakdown.requestId || requestKey !== taxonomyScopeKey('portfolio')) return;
     _bkData = buildModernBreakdownDataset(taxonomy);
     renderModernBreakdown('portfolio');
   } catch(e) {
+    var tab = document.getElementById('tab-categories');
+    if (requestId !== buildBreakdown.requestId || requestKey !== taxonomyScopeKey('portfolio') || !tab || !tab.classList.contains('active')) return;
+    if (e && e.name === 'StaleDataRequest') {
+      if (!retriedStale) return buildBreakdown(active && active.data, true);
+      if (el) el.innerHTML = '<div class="empty-msg">Saved analysis changed again. Reopen Breakdown to reload.</div>';
+      return;
+    }
     if (el) el.innerHTML = '<div class="empty-msg">Category analysis failed: '+esc(e.message)+'</div>';
   }
 }
 
 function renderBreakdownTaxonomy(){ renderModernBreakdown('portfolio'); }
 
-async function buildMarketAnalysis(){
+async function buildMarketAnalysis(retriedStale){
+  var requestId = buildMarketAnalysis.requestId = (buildMarketAnalysis.requestId || 0) + 1;
+  var requestKey = taxonomyScopeKey('market');
   var loading = document.getElementById('market-loading');
   var content = document.getElementById('market-content');
   var hasMarketData = !!(_marketBkData && _marketBkData.source && _marketBkData.source.length);
@@ -7059,12 +7071,22 @@ async function buildMarketAnalysis(){
   renderMarketDataStatus(null, {loading:true, message: hasMarketData ? 'Keeping the current full-market basket visible while recomputing '+(researchPeriodDays())+'d metrics.' : 'Loading full-market basket analysis...'});
   try {
     var data = await loadTaxonomyAnalysis('market', false);
+    if (requestId !== buildMarketAnalysis.requestId || requestKey !== taxonomyScopeKey('market')) return;
     if (!data || !data.dimensions || !data.dimensions.length) throw new Error('No market dimensions returned');
     _marketBkData = buildModernBreakdownDataset(data);
     renderModernBreakdown('market');
     if (loading) loading.style.display = 'none';
     if (content) content.style.display = '';
   } catch(e) {
+    var tab = document.getElementById('tab-market');
+    if (requestId !== buildMarketAnalysis.requestId || requestKey !== taxonomyScopeKey('market') || !tab || !tab.classList.contains('active')) return;
+    if (e && e.name === 'StaleDataRequest') {
+      if (!retriedStale) return buildMarketAnalysis(true);
+      var message = 'Saved analysis changed again. Use Refresh Status to reload.';
+      if (loading) { loading.style.display = ''; loading.innerHTML = '<div class="empty-msg">'+message+'</div>'; }
+      renderMarketDataStatus(null, {error:true, message:message});
+      return;
+    }
     if (loading) loading.innerHTML = '<div class="empty-msg">Market analysis failed: '+esc(e.message)+'</div>';
     renderMarketDataStatus(null, {error:true, message:'Market analysis failed: '+e.message});
   }

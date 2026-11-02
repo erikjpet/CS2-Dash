@@ -82,3 +82,12 @@ real Chart datasets for 90 days, 7 days and All in both research scopes, and
 opens both cash detail views. Retain all earlier evidence and source identities;
 this selected run does not represent a complete twelve-case rerun. Provider
 acquisition remains disabled and all fixture data remain invented.
+
+UI03 executed B6 and affected B7 on exact
+`07d21ec5f912ce70eb90a6505764df1d9025216e`: both passed in 19.083 browser
+seconds. Both research scopes returned exact listing history and drew real
+90-day/7-day/All datasets; both cash detail scopes and both global-price
+filter/pagination paths passed. There were no page errors. The owned job
+released with zero processes, its listener closed and temporary data cleaned.
+This completes combined macro-case evidence across UI01/UI02/UI03; live
+activation and genuine production-history availability remain separate stages.
