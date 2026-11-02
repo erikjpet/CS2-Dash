@@ -1,6 +1,6 @@
 # CS2-04 — Version-one feature parity matrix
 
-Updated 2026-11-02. **Source restoration and portable checks passed. Browser acceptance, publication and live verification remain pending. CS2-04 is not complete.**
+Updated 2026-11-02. **Source restoration, portable checks and main publication passed. Browser acceptance and live verification remain pending. CS2-04 is not complete.**
 
 This is the canonical delivery matrix for all **74** intake IDs. The original audited-live findings and line references are preserved in [the intake inventory](../tools/CS2-04-control-parity.md). “Audited live” below means that unchanged intake, not the isolated restoration. No initial missing/hidden finding is silently relabelled as a live repair.
 
@@ -13,7 +13,7 @@ There is no GitHub Release or tag for v1. The original v1.0 commit is `de8a46918
 | Source | Research scope/widgets/routes restored alongside current cash functionality in isolated CS2 worktree. All 10 metric windows are materialized by explicit refresh. Warm/Sync use the continuing tracked job with selected-portfolio scope. |
 | Portable tests | **85** application checks: `tests` 17, `tools` 48 (36 runtime + 12 recovery), frontend Node 20. **9** additional site checks: runtime profile 5 and sync 4. Root syntax checks passed for 37 Python root files, root MJS files and the PowerShell launcher. |
 | Browser | **Pending for every row.** Prepared real-browser invented-data cases B1–B12; no restoration browser/listener run claimed. See [acceptance runner](../tools/V1-BROWSER-ACCEPTANCE.md). |
-| Published | **Pending for every row.** Publish the guarded site integration and upstream main consecutively, recording both exact commits. The Docker package guard protects the intervening source mismatch. |
+| Published | **Confirmed to existing main branches:** CS2 implementation `e7894fe94e297aa442566724cf7acc318b29539d`; guarded site integration `b827906cd32d04c1c822e0eef581b47acd796cde`. Both remote identities were verified after consecutive publication. Later checkpoint-documentation commits do not alter this implementation. |
 | Live | **Pending for every row.** No source/data promotion or service restart performed for this restoration. |
 | Full v1 parity | **Open.** Source/test coverage is not proof that every click, real dataset and upstream prerequisite works in the deployed service. |
 
@@ -30,7 +30,7 @@ Evidence keys: **F** = [20 frontend Node checks](../tools/frontend_restore.test.
 
 ## Feature matrix
 
-Rows have the portable source coverage/limits listed. Warm/Sync now use the continuing explicit job: Warm is bounded to 80 selected-portfolio items; Sync All batches only the selected portfolio, preserves cached history as its resume checkpoint, and reports an error rather than silently truncating scopes above 10,000. Browser, pushed and live stages remain **pending**, including rows that were retained at intake. "F source" is a source contract, not proof of each interaction. Owners are implementation responsibilities; root integration owns publication, cutover and final live acceptance for every row.
+Rows have the portable source coverage/limits listed and are included in the confirmed main publication above. Warm/Sync now use the continuing explicit job: Warm is bounded to 80 selected-portfolio items; Sync All batches only the selected portfolio, preserves cached history as its resume checkpoint, and reports an error rather than silently truncating scopes above 10,000. Browser and live stages remain **pending**, including rows that were retained at intake. "F source" is a source contract, not proof of each interaction. Root integration owns cutover and final live acceptance for every row.
 
 | ID | Published v1 control / contract | Audited live intake | Isolated restoration | Owner | Portable evidence and remaining acceptance |
 | --- | --- | --- | --- | --- | --- |
